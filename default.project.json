@@ -1,0 +1,31 @@
+{
+  "name": "Don't Drop The Egg!",
+  "tree": {
+    "$className": "DataModel",
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "$ignoreUnknownInstances": true,
+      "$path": "src/ServerScriptService"
+    },
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterCharacterScripts": {
+        "$className": "StarterCharacterScripts",
+        "$ignoreUnknownInstances": true,
+        "$path": "src/StarterCharacterScripts"
+      },
+      "$properties": {
+        "CameraMaxZoomDistance": 128.0,
+        "CharacterBreakJointsOnDeath": false,
+        "CharacterUseJumpPower": false
+      },
+      "$ignoreUnknownInstances": true
+    }
+  },
+  "emitLegacyScripts": true,
+  "syncbackRules": {
+    "syncCurrentCamera": false,
+    "syncUnscriptable": false,
+    "ignoreReferents": false
+  }
+}

@@ -1,0 +1,40 @@
+.DS_Store
+
+# RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Secrets
+.env
+.env.*
+*.key
+*.pem
+auth.json
+.codex/
+
+# Generated files
+build/
+dist/
+sourcemap.json
+*.tmp
+*.log
+*.rbxl.lock
+*.rbxl.lock
+*.rbxl.lock
+
+# Roblox Studio local files
+*.rbxl
+*.rbxlx
+*.rbxl.lock
+
+# macOS
+.DS_Store
+.tools/
+*.rbxl.lock
+.DS_Store
+.tools/
+*.rbxl.lock
+.DS_Store
+.tools/
