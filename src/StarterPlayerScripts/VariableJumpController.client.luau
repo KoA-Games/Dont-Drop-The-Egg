@@ -8,13 +8,10 @@ local Workspace = game:GetService("Workspace")
 local player = Players.LocalPlayer
 
 -- Keyboard-only five-egg tuning for this milestone.
-local INITIAL_HOP_SPEED = 12
-local HOLD_BOOST_ACCELERATION = 75
-local HOLD_BOOST_RAMP_TIME = 0.10
-local MAX_HOLD_TIME = 0.40
--- Once reached, assistance stays disabled for the rest of that jump.
-local MAX_UPWARD_SPEED = 30
-local LANDING_LOCK_TIME = 0.08
+local INITIAL_JUMP_SPEED = 24
+local HOLD_UPWARD_ACCELERATION = 110
+local MAX_HOLD_TIME = 0.35
+local EARLY_RELEASE_MULTIPLIER = 0.55
 
 local ACTION_NAME = "KoAVariableJump"
 local ACTION_PRIORITY = Enum.ContextActionPriority.High.Value + 1000
@@ -33,7 +30,6 @@ type CharacterState = {
 	connections: { RBXScriptConnection },
 	jumpActive: boolean,
 	isHoldingJump: boolean,
-	boostLockedOut: boolean,
 	leftGround: boolean,
 	pressTime: number,
 	holdDuration: number,
@@ -44,11 +40,6 @@ type CharacterState = {
 
 local state: CharacterState? = nil
 local defaultJumpConsumed = false
-
-local function smoothStep(value: number): number
-	local alpha = math.clamp(value, 0, 1)
-	return alpha * alpha * (3 - 2 * alpha)
-end
 
 local function zeroHoldForce(current: CharacterState)
 	current.holdForce.Force = Vector3.zero
@@ -134,7 +125,6 @@ local function beginJump(current: CharacterState)
 
 	current.jumpActive = true
 	current.isHoldingJump = true
-	current.boostLockedOut = false
 	current.leftGround = false
 	current.pressTime = os.clock()
 	current.holdDuration = 0
@@ -143,10 +133,34 @@ local function beginJump(current: CharacterState)
 	current.maximumBasketLag = 0
 
 	-- The default Space action is sunk, so this is the only launch request.
-	-- Humanoid performs one normal but deliberately small 12-speed takeoff;
-	-- there is no second PlayerModule launch underneath it.
-	current.humanoid.JumpPower = INITIAL_HOP_SPEED
+	-- Change state for normal Humanoid behavior, then set the launch velocity once.
 	current.humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+	local velocity = current.root.AssemblyLinearVelocity
+	current.root.AssemblyLinearVelocity = Vector3.new(
+		velocity.X,
+		INITIAL_JUMP_SPEED,
+		velocity.Z
+	)
+end
+
+local function releaseJump(current: CharacterState)
+	if not current.isHoldingJump then
+		return
+	end
+
+	local releasedEarly = os.clock() - current.pressTime < MAX_HOLD_TIME
+	stopHolding(current)
+
+	if releasedEarly then
+		local velocity = current.root.AssemblyLinearVelocity
+		if velocity.Y > 0 then
+			current.root.AssemblyLinearVelocity = Vector3.new(
+				velocity.X,
+				velocity.Y * EARLY_RELEASE_MULTIPLIER,
+				velocity.Z
+			)
+		end
+	end
 end
 
 local function finishLanding(current: CharacterState)
@@ -179,10 +193,7 @@ local function handleJumpAction(
 		if inputState == Enum.UserInputState.Begin then
 			beginJump(current)
 		elseif inputState == Enum.UserInputState.End then
-			-- Releasing the button removes only the extra upward force. Preserve the
-			-- character's existing momentum so the welded basket cannot suddenly
-			-- slow underneath native-physics eggs that are still moving upward.
-			stopHolding(current)
+			releaseJump(current)
 		elseif inputState == Enum.UserInputState.Cancel then
 			stopHolding(current)
 		end
@@ -230,10 +241,9 @@ local function attachCharacter(character: Model)
 	holdForce.Enabled = false
 	holdForce.Parent = rootInstance
 
-	-- The default 50-power launch is replaced by the custom action's small hop.
-	-- Space is sunk at high priority, so this value runs only once per Begin.
+	-- Space is sunk at high priority; launch velocity is set directly on Begin.
 	humanoidInstance.UseJumpPower = true
-	humanoidInstance.JumpPower = INITIAL_HOP_SPEED
+	humanoidInstance.JumpPower = 0
 	humanoidInstance.AutoJumpEnabled = false
 	humanoidInstance.Jump = false
 
@@ -246,7 +256,6 @@ local function attachCharacter(character: Model)
 		connections = {},
 		jumpActive = false,
 		isHoldingJump = false,
-		boostLockedOut = false,
 		leftGround = false,
 		pressTime = 0,
 		holdDuration = 0,
@@ -271,7 +280,6 @@ local function attachCharacter(character: Model)
 			current.leftGround = true
 		elseif current.jumpActive
 			and current.leftGround
-			and os.clock() - current.pressTime >= LANDING_LOCK_TIME
 			and (newState == Enum.HumanoidStateType.Landed
 				or newState == Enum.HumanoidStateType.Running
 				or newState == Enum.HumanoidStateType.RunningNoPhysics)
@@ -345,10 +353,7 @@ RunService.PreSimulation:Connect(function()
 	end
 
 	local elapsed = os.clock() - current.pressTime
-	if elapsed >= MAX_HOLD_TIME
-		or (elapsed >= LANDING_LOCK_TIME
-			and current.root.AssemblyLinearVelocity.Y <= 0)
-	then
+	if elapsed >= MAX_HOLD_TIME then
 		-- Reaching the time cap ends assistance without changing velocity.
 		-- Character, basket, and eggs keep continuous trajectories while natural
 		-- gravity completes the jump.
@@ -356,27 +361,9 @@ RunService.PreSimulation:Connect(function()
 		return
 	end
 
-	if current.boostLockedOut then
-		zeroHoldForce(current)
-		return
-	end
-
-	if current.root.AssemblyLinearVelocity.Y >= MAX_UPWARD_SPEED then
-		current.boostLockedOut = true
-		zeroHoldForce(current)
-		return
-	end
-
-	local rampAlpha = smoothStep(elapsed / HOLD_BOOST_RAMP_TIME)
-	local boostAcceleration = HOLD_BOOST_ACCELERATION * rampAlpha
-
-	-- Restored baseline: the character-only hold force moves the rigid basket;
-	-- all eggs remain independent native assemblies driven only by gravity and
-	-- physical contact with the basket and each other.
-	local totalAssistanceAcceleration = Workspace.Gravity + boostAcceleration
 	current.holdForce.Force = Vector3.new(
 		0,
-		current.root.AssemblyMass * totalAssistanceAcceleration,
+		current.root.AssemblyMass * HOLD_UPWARD_ACCELERATION,
 		0
 	)
 	current.holdForce.Enabled = true
