@@ -2,12 +2,13 @@
 
 local Players = game:GetService("Players")
 local ContentProvider = game:GetService("ContentProvider")
+local RunService = game:GetService("RunService")
 
 -- Measured from Workspace.Rig.Head:ToObjectSpace(Workspace.Rig.Basket:GetPivot()).
 -- This moves only the generated gameplay basket; the preview Basket is not copied.
--- BasketHold tilts Head slightly backward. Counter-pitch the Head-attached
--- basket forward so it appears level in the authored gameplay pose.
-local BASKET_FORWARD_PITCH_DEGREES = -2.4
+-- Keep the authored placement neutral before it is captured by the rigid
+-- HumanoidRootPart mount.
+local BASKET_FORWARD_PITCH_DEGREES = 0
 local BASKET_OFFSET = CFrame.new(
 	0.0020941495895385742,
 	0.6161737442016602,
@@ -33,19 +34,44 @@ end
 local BASKET_NAME = "Basket"
 local LEGACY_BASKET_NAME = "TemporaryBasket"
 local BASKET_TARGET_NAME = "BasketTarget"
+local BASKET_ORIENTATION_TARGET_NAME = "BasketOrientationTarget"
 local BASKET_ATTACHMENT_NAME = "BasketAttachment"
-local BASKET_POSITION_ALIGN_NAME = "BasketAlignPosition"
-local BASKET_ORIENTATION_ALIGN_NAME = "BasketAlignOrientation"
-local SOFT_MOUNT_READY_ATTRIBUTE = "SoftMountReady"
-local BASKET_COLOR = Color3.fromRGB(151, 105, 54)
-local BASKET_MATERIAL = Enum.Material.Wood
+local MOUNT_READY_ATTRIBUTE = "BasketMountReady"
+-- Visual-only woven prototype dimensions. Bottom remains the physical mount
+-- reference, so changing the appearance never changes the authored hand pose.
+local LOWER_OUTER_WIDTH = 2.05
+local LOWER_OUTER_DEPTH = 1.55
+local UPPER_OUTER_WIDTH = 2.55
+local UPPER_OUTER_DEPTH = 2.20
+local VISUAL_WALL_HEIGHT = 0.90
+local BOTTOM_THICKNESS = 0.20
+local PANEL_THICKNESS = 0.10
+local PANEL_OVERLAP = 0.03
+local WEAVE_DETAIL_HEIGHT = 0.07
+local WEAVE_DETAIL_THICKNESS = 0.035
+local RIM_HEIGHT = 0.18
+local RIM_THICKNESS = 0.12
+local SUPPORT_THICKNESS = 0.11
 
--- Soft physical suspension. Tune only these values when refining lag.
-local POSITION_RESPONSIVENESS = 200
-local POSITION_MAX_VELOCITY = 80
-local POSITION_MAX_FORCE_PER_MASS = 2500
-local ORIENTATION_RESPONSIVENESS = 20
-local ORIENTATION_MAX_TORQUE_PER_MASS = 3000
+local BOTTOM_COLOR = Color3.fromRGB(151, 94, 42)
+local PANEL_LOWER_COLOR = Color3.fromRGB(171, 111, 51)
+local PANEL_MIDDLE_COLOR = Color3.fromRGB(165, 103, 45)
+local PANEL_UPPER_COLOR = Color3.fromRGB(158, 96, 41)
+local WEAVE_DETAIL_COLOR = Color3.fromRGB(112, 64, 27)
+local SUPPORT_COLOR = Color3.fromRGB(126, 73, 31)
+local RIM_COLOR = Color3.fromRGB(202, 142, 72)
+local PANEL_MATERIAL = Enum.Material.Fabric
+local STRUCTURE_MATERIAL = Enum.Material.WoodPlanks
+
+-- A physical follower is required because animated hand motion is relative to
+-- HumanoidRootPart. Jump velocity is seeded once by VariableJumpController so
+-- these constraints never need to catch up from zero during takeoff.
+local POSITION_RESPONSIVENESS = 120
+local POSITION_MAX_VELOCITY = 70
+local HORIZONTAL_MAX_FORCE_PER_MASS = 2400
+local VERTICAL_MAX_FORCE_PER_MASS = 1600
+local ORIENTATION_RESPONSIVENESS = 100
+local ORIENTATION_MAX_TORQUE_PER_MASS = 1400
 
 local RIGHT_IK_NAME = "BasketRightArmIK"
 local LEFT_IK_NAME = "BasketLeftArmIK"
@@ -83,43 +109,9 @@ local LEFT_GRIP_TARGET_OFFSET = CFrame.lookAt(
 local RIGHT_ELBOW_POLE_OFFSET = CFrame.new(2.0, -1.2, 0.35)
 local LEFT_ELBOW_POLE_OFFSET = CFrame.new(-2.0, -1.2, 0.35)
 
-type BasketPartDefinition = {
-	name: string,
-	size: Vector3,
-	offset: CFrame,
-}
-
-local BASKET_PARTS: { BasketPartDefinition } = {
-	{
-		name = "Bottom",
-		size = Vector3.new(2.4, 0.2, 1.8),
-		offset = CFrame.new(0, 0, 0),
-	},
-	{
-		name = "FrontWall",
-		size = Vector3.new(2.4, 0.65, 0.18),
-		offset = CFrame.new(0, 0.425, -0.81),
-	},
-	{
-		name = "BackWall",
-		size = Vector3.new(2.4, 0.65, 0.18),
-		offset = CFrame.new(0, 0.425, 0.81),
-	},
-	{
-		name = "LeftWall",
-		size = Vector3.new(0.18, 0.65, 1.8),
-		offset = CFrame.new(-1.11, 0.425, 0),
-	},
-	{
-		name = "RightWall",
-		size = Vector3.new(0.18, 0.65, 1.8),
-		offset = CFrame.new(1.11, 0.425, 0),
-	},
-}
-
-local function configureBasketPart(part: Part)
-	part.Color = BASKET_COLOR
-	part.Material = BASKET_MATERIAL
+local function configureBottomAnchor(part: Part)
+	part.Transparency = 1
+	part.Material = Enum.Material.SmoothPlastic
 	part.TopSurface = Enum.SurfaceType.Smooth
 	part.BottomSurface = Enum.SurfaceType.Smooth
 	part.Anchored = false
@@ -129,34 +121,364 @@ local function configureBasketPart(part: Part)
 	part.Massless = true
 end
 
-local function removeOldBasketTarget(root: BasePart)
-	local existing = root:FindFirstChild(BASKET_TARGET_NAME)
-	if existing then
-		existing:Destroy()
+local function configureVisibleBasketPart(part: Part, color: Color3)
+	part.Color = color
+	part.Material = if part.Name:find("Panel") or part.Name:find("WeaveStrip")
+		then PANEL_MATERIAL
+		else STRUCTURE_MATERIAL
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	part.Anchored = false
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.Massless = true
+	part.CastShadow = true
+end
+
+local function removeOldBasketTarget(character: Model)
+	for _, descendant in character:GetDescendants() do
+		if descendant:IsA("Attachment") and (
+			descendant.Name == BASKET_TARGET_NAME
+			or descendant.Name == BASKET_ORIENTATION_TARGET_NAME
+		) then
+			descendant:Destroy()
+		end
 	end
 end
 
-local function createBasketPart(
-	definition: BasketPartDefinition,
-	basketPivot: CFrame,
-	basket: Model
-): Part
-	local part = Instance.new("Part")
-	part.Name = definition.name
-	part.Size = definition.size
-	configureBasketPart(part)
-	part.CFrame = basketPivot * definition.offset
-	part.Parent = basket
-
-	return part
-end
-
-local function weldParts(part0: BasePart, part1: BasePart, name: string)
+local function weldParts(part0: BasePart, part1: BasePart, name: string): WeldConstraint
 	local weld = Instance.new("WeldConstraint")
 	weld.Name = name
 	weld.Part0 = part0
 	weld.Part1 = part1
 	weld.Parent = part1
+	return weld
+end
+
+local function createVisualPart(
+	name: string,
+	size: Vector3,
+	localCFrame: CFrame,
+	color: Color3,
+	parent: Instance,
+	bottom: BasePart
+): Part
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Size = size
+	configureVisibleBasketPart(part, color)
+	part.CFrame = bottom.CFrame * localCFrame
+	part.Parent = parent
+	weldParts(bottom, part, "BottomWeld")
+	return part
+end
+
+local function createFolder(name: string, parent: Instance): Folder
+	local folder = Instance.new("Folder")
+	folder.Name = name
+	folder.Parent = parent
+	return folder
+end
+
+local function supportLocalCFrame(lowerPoint: Vector3, upperPoint: Vector3): CFrame
+	local direction = upperPoint - lowerPoint
+	local yAxis = direction.Unit
+	local xAxis = Vector3.xAxis
+	local zAxis = xAxis:Cross(yAxis).Unit
+	xAxis = yAxis:Cross(zAxis).Unit
+	return CFrame.fromMatrix((lowerPoint + upperPoint) * 0.5, xAxis, yAxis, zAxis)
+end
+
+local function widthAt(alpha: number): number
+	return LOWER_OUTER_WIDTH + (UPPER_OUTER_WIDTH - LOWER_OUTER_WIDTH) * alpha
+end
+
+local function depthAt(alpha: number): number
+	return LOWER_OUTER_DEPTH + (UPPER_OUTER_DEPTH - LOWER_OUTER_DEPTH) * alpha
+end
+
+local function frontBackPanelCFrame(
+	zSign: number,
+	startAlpha: number,
+	endAlpha: number,
+	floorTop: number
+): (CFrame, number)
+	local lowerPoint = Vector3.new(
+		0,
+		floorTop + VISUAL_WALL_HEIGHT * startAlpha,
+		zSign * (depthAt(startAlpha) * 0.5 - PANEL_THICKNESS * 0.5)
+	)
+	local upperPoint = Vector3.new(
+		0,
+		floorTop + VISUAL_WALL_HEIGHT * endAlpha,
+		zSign * (depthAt(endAlpha) * 0.5 - PANEL_THICKNESS * 0.5)
+	)
+	local yAxis = (upperPoint - lowerPoint).Unit
+	local xAxis = Vector3.xAxis
+	local zAxis = xAxis:Cross(yAxis).Unit
+	return CFrame.fromMatrix((lowerPoint + upperPoint) * 0.5, xAxis, yAxis, zAxis),
+		(upperPoint - lowerPoint).Magnitude
+end
+
+local function leftRightPanelCFrame(
+	xSign: number,
+	startAlpha: number,
+	endAlpha: number,
+	floorTop: number
+): (CFrame, number)
+	local lowerPoint = Vector3.new(
+		xSign * (widthAt(startAlpha) * 0.5 - PANEL_THICKNESS * 0.5),
+		floorTop + VISUAL_WALL_HEIGHT * startAlpha,
+		0
+	)
+	local upperPoint = Vector3.new(
+		xSign * (widthAt(endAlpha) * 0.5 - PANEL_THICKNESS * 0.5),
+		floorTop + VISUAL_WALL_HEIGHT * endAlpha,
+		0
+	)
+	local yAxis = (upperPoint - lowerPoint).Unit
+	local zAxis = Vector3.zAxis
+	local xAxis = yAxis:Cross(zAxis).Unit
+	return CFrame.fromMatrix((lowerPoint + upperPoint) * 0.5, xAxis, yAxis, zAxis),
+		(upperPoint - lowerPoint).Magnitude
+end
+
+local function frontBackDetailCFrame(zSign: number, alpha: number, floorTop: number): CFrame
+	local lowerPoint = Vector3.new(
+		0,
+		floorTop,
+		zSign * (LOWER_OUTER_DEPTH * 0.5 + WEAVE_DETAIL_THICKNESS * 0.5)
+	)
+	local upperPoint = Vector3.new(
+		0,
+		floorTop + VISUAL_WALL_HEIGHT,
+		zSign * (UPPER_OUTER_DEPTH * 0.5 + WEAVE_DETAIL_THICKNESS * 0.5)
+	)
+	local yAxis = (upperPoint - lowerPoint).Unit
+	local xAxis = Vector3.xAxis
+	local zAxis = xAxis:Cross(yAxis).Unit
+	local position = lowerPoint:Lerp(upperPoint, alpha)
+	return CFrame.fromMatrix(position, xAxis, yAxis, zAxis)
+end
+
+local function leftRightDetailCFrame(xSign: number, alpha: number, floorTop: number): CFrame
+	local lowerPoint = Vector3.new(
+		xSign * (LOWER_OUTER_WIDTH * 0.5 + WEAVE_DETAIL_THICKNESS * 0.5),
+		floorTop,
+		0
+	)
+	local upperPoint = Vector3.new(
+		xSign * (UPPER_OUTER_WIDTH * 0.5 + WEAVE_DETAIL_THICKNESS * 0.5),
+		floorTop + VISUAL_WALL_HEIGHT,
+		0
+	)
+	local yAxis = (upperPoint - lowerPoint).Unit
+	local zAxis = Vector3.zAxis
+	local xAxis = yAxis:Cross(zAxis).Unit
+	local position = lowerPoint:Lerp(upperPoint, alpha)
+	return CFrame.fromMatrix(position, xAxis, yAxis, zAxis)
+end
+
+local function createWovenVisualBasket(basket: Model, bottom: BasePart)
+	local visualBasket = Instance.new("Model")
+	visualBasket.Name = "VisualBasket"
+	visualBasket.Parent = basket
+	local floorTop = BOTTOM_THICKNESS * 0.5
+
+	createVisualPart(
+		"BottomPanel",
+		Vector3.new(LOWER_OUTER_WIDTH, BOTTOM_THICKNESS, LOWER_OUTER_DEPTH),
+		CFrame.identity,
+		BOTTOM_COLOR,
+		visualBasket,
+		bottom
+	)
+
+	-- Three overlapping solid courses per face keep the wall visually closed while
+	-- approximating a trapezoid with ordinary Roblox Parts.
+	local frontPanel = Instance.new("Model")
+	frontPanel.Name = "FrontPanel"
+	frontPanel.Parent = visualBasket
+	local backPanel = Instance.new("Model")
+	backPanel.Name = "BackPanel"
+	backPanel.Parent = visualBasket
+	local leftPanel = Instance.new("Model")
+	leftPanel.Name = "LeftPanel"
+	leftPanel.Parent = visualBasket
+	local rightPanel = Instance.new("Model")
+	rightPanel.Name = "RightPanel"
+	rightPanel.Parent = visualBasket
+
+	local panelSegments = {
+		{
+			0,
+			1 / 3 + PANEL_OVERLAP * 0.5 / VISUAL_WALL_HEIGHT,
+			"LowerPanel",
+			PANEL_LOWER_COLOR,
+		},
+		{
+			1 / 3 - PANEL_OVERLAP * 0.5 / VISUAL_WALL_HEIGHT,
+			2 / 3 + PANEL_OVERLAP * 0.5 / VISUAL_WALL_HEIGHT,
+			"MiddlePanel",
+			PANEL_MIDDLE_COLOR,
+		},
+		{
+			2 / 3 - PANEL_OVERLAP * 0.5 / VISUAL_WALL_HEIGHT,
+			1,
+			"UpperPanel",
+			PANEL_UPPER_COLOR,
+		},
+	}
+	for _, segment in panelSegments do
+		local startAlpha = segment[1] :: number
+		local endAlpha = segment[2] :: number
+		local partName = segment[3] :: string
+		local color = segment[4] :: Color3
+		local midpointAlpha = (startAlpha + endAlpha) * 0.5
+		local frontCFrame, frontLength = frontBackPanelCFrame(-1, startAlpha, endAlpha, floorTop)
+		local backCFrame, backLength = frontBackPanelCFrame(1, startAlpha, endAlpha, floorTop)
+		local leftCFrame, leftLength = leftRightPanelCFrame(-1, startAlpha, endAlpha, floorTop)
+		local rightCFrame, rightLength = leftRightPanelCFrame(1, startAlpha, endAlpha, floorTop)
+
+		createVisualPart(
+			partName,
+			Vector3.new(widthAt(midpointAlpha), frontLength, PANEL_THICKNESS),
+			frontCFrame,
+			color,
+			frontPanel,
+			bottom
+		)
+		createVisualPart(
+			partName,
+			Vector3.new(widthAt(midpointAlpha), backLength, PANEL_THICKNESS),
+			backCFrame,
+			color,
+			backPanel,
+			bottom
+		)
+		createVisualPart(
+			partName,
+			Vector3.new(PANEL_THICKNESS, leftLength, depthAt(midpointAlpha)),
+			leftCFrame,
+			color,
+			leftPanel,
+			bottom
+		)
+		createVisualPart(
+			partName,
+			Vector3.new(PANEL_THICKNESS, rightLength, depthAt(midpointAlpha)),
+			rightCFrame,
+			color,
+			rightPanel,
+			bottom
+		)
+	end
+
+	local frontDetails = createFolder("FrontWeaveDetails", visualBasket)
+	local backDetails = createFolder("BackWeaveDetails", visualBasket)
+	local leftDetails = createFolder("LeftWeaveDetails", visualBasket)
+	local rightDetails = createFolder("RightWeaveDetails", visualBasket)
+	for detailIndex, alpha in { 0.31, 0.69 } do
+		local detailName = "WeaveStrip" .. tostring(detailIndex)
+		createVisualPart(
+			detailName,
+			Vector3.new(widthAt(alpha) - 0.06, WEAVE_DETAIL_HEIGHT, WEAVE_DETAIL_THICKNESS),
+			frontBackDetailCFrame(-1, alpha, floorTop),
+			WEAVE_DETAIL_COLOR,
+			frontDetails,
+			bottom
+		)
+		createVisualPart(
+			detailName,
+			Vector3.new(widthAt(alpha) - 0.06, WEAVE_DETAIL_HEIGHT, WEAVE_DETAIL_THICKNESS),
+			frontBackDetailCFrame(1, alpha, floorTop),
+			WEAVE_DETAIL_COLOR,
+			backDetails,
+			bottom
+		)
+		createVisualPart(
+			detailName,
+			Vector3.new(WEAVE_DETAIL_THICKNESS, WEAVE_DETAIL_HEIGHT, depthAt(alpha) - 0.06),
+			leftRightDetailCFrame(-1, alpha, floorTop),
+			WEAVE_DETAIL_COLOR,
+			leftDetails,
+			bottom
+		)
+		createVisualPart(
+			detailName,
+			Vector3.new(WEAVE_DETAIL_THICKNESS, WEAVE_DETAIL_HEIGHT, depthAt(alpha) - 0.06),
+			leftRightDetailCFrame(1, alpha, floorTop),
+			WEAVE_DETAIL_COLOR,
+			rightDetails,
+			bottom
+		)
+	end
+
+	local supports = createFolder("CornerSupports", visualBasket)
+	local cornerSigns = {
+		{ -1, -1, "FrontLeftSupport" },
+		{ 1, -1, "FrontRightSupport" },
+		{ -1, 1, "BackLeftSupport" },
+		{ 1, 1, "BackRightSupport" },
+	}
+	for _, corner in cornerSigns do
+		local xSign = corner[1] :: number
+		local zSign = corner[2] :: number
+		local lowerPoint = Vector3.new(
+			xSign * (LOWER_OUTER_WIDTH * 0.5 - SUPPORT_THICKNESS * 0.5),
+			floorTop,
+			zSign * (LOWER_OUTER_DEPTH * 0.5 - SUPPORT_THICKNESS * 0.5)
+		)
+		local upperPoint = Vector3.new(
+			xSign * (UPPER_OUTER_WIDTH * 0.5 - SUPPORT_THICKNESS * 0.5),
+			floorTop + VISUAL_WALL_HEIGHT,
+			zSign * (UPPER_OUTER_DEPTH * 0.5 - SUPPORT_THICKNESS * 0.5)
+		)
+		createVisualPart(
+			corner[3] :: string,
+			Vector3.new(SUPPORT_THICKNESS, (upperPoint - lowerPoint).Magnitude, SUPPORT_THICKNESS),
+			supportLocalCFrame(lowerPoint, upperPoint),
+			SUPPORT_COLOR,
+			supports,
+			bottom
+		)
+	end
+
+	local topRim = createFolder("TopRim", visualBasket)
+	local rimY = floorTop + VISUAL_WALL_HEIGHT
+	createVisualPart(
+		"FrontRim",
+		Vector3.new(UPPER_OUTER_WIDTH, RIM_HEIGHT, RIM_THICKNESS),
+		CFrame.new(0, rimY, -(UPPER_OUTER_DEPTH * 0.5 - RIM_THICKNESS * 0.5)),
+		RIM_COLOR,
+		topRim,
+		bottom
+	)
+	createVisualPart(
+		"BackRim",
+		Vector3.new(UPPER_OUTER_WIDTH, RIM_HEIGHT, RIM_THICKNESS),
+		CFrame.new(0, rimY, UPPER_OUTER_DEPTH * 0.5 - RIM_THICKNESS * 0.5),
+		RIM_COLOR,
+		topRim,
+		bottom
+	)
+	createVisualPart(
+		"LeftRim",
+		Vector3.new(RIM_THICKNESS, RIM_HEIGHT, UPPER_OUTER_DEPTH),
+		CFrame.new(-(UPPER_OUTER_WIDTH * 0.5 - RIM_THICKNESS * 0.5), rimY, 0),
+		RIM_COLOR,
+		topRim,
+		bottom
+	)
+	createVisualPart(
+		"RightRim",
+		Vector3.new(RIM_THICKNESS, RIM_HEIGHT, UPPER_OUTER_DEPTH),
+		CFrame.new(UPPER_OUTER_WIDTH * 0.5 - RIM_THICKNESS * 0.5, rimY, 0),
+		RIM_COLOR,
+		topRim,
+		bottom
+	)
 end
 
 local function createHandTarget(bottom: BasePart, name: string, targetCFrame: CFrame): Attachment
@@ -418,12 +740,41 @@ local function clearOldBasket(character: Model)
 	end
 end
 
-local function attachBasket(character: Model)
-	clearOldBasket(character)
+local function getIntendedMountLocalCFrames(
+	character: Model,
+	root: BasePart,
+	head: BasePart
+): (CFrame, CFrame)
+	local existingBasket = character:FindFirstChild(BASKET_NAME)
+	if existingBasket and existingBasket:IsA("Model") then
+		local bottom = existingBasket:FindFirstChild("Bottom")
+		if bottom and bottom:IsA("BasePart") then
+			local basketAttachment = bottom:FindFirstChild(BASKET_ATTACHMENT_NAME)
+			local basketTarget: Attachment? = nil
+			for _, descendant in character:GetDescendants() do
+				if descendant.Name == BASKET_TARGET_NAME and descendant:IsA("Attachment") then
+					basketTarget = descendant
+					break
+				end
+			end
 
+			if basketAttachment and basketAttachment:IsA("Attachment") and basketTarget then
+				return root.CFrame:ToObjectSpace(basketTarget.WorldCFrame), basketAttachment.CFrame
+			end
+		end
+	end
+
+	-- This is the same local target used by the original root-attached
+	-- BasketTarget. BasketAttachment was identity in that system.
+	local targetLocalCFrame = root.CFrame:ToObjectSpace(head.CFrame * BASKET_OFFSET)
+	return targetLocalCFrame, CFrame.identity
+end
+
+local function attachBasket(character: Model)
 	local head = character:WaitForChild("Head", 10)
 	local humanoid = character:WaitForChild("Humanoid", 10)
 	local root = character:WaitForChild("HumanoidRootPart", 10)
+	local rightHand = character:WaitForChild("RightHand", 10)
 	if not head or not head:IsA("BasePart") then
 		warn("BasketAttachmentService: character Head was not available")
 		return
@@ -436,111 +787,47 @@ local function attachBasket(character: Model)
 		warn("BasketAttachmentService: HumanoidRootPart was not available")
 		return
 	end
-
-	removeOldBasketTarget(root)
-
-	local basket = Instance.new("Model")
-	basket.Name = BASKET_NAME
-	basket:SetAttribute(SOFT_MOUNT_READY_ATTRIBUTE, false)
-
-	local basketPivot = head.CFrame * BASKET_OFFSET
-	local bottom: Part? = nil
-
-	for _, definition in BASKET_PARTS do
-		local part = createBasketPart(definition, basketPivot, basket)
-		if definition.name == "Bottom" then
-			bottom = part
-		end
-	end
-
-	if not bottom then
-		basket:Destroy()
-		warn("BasketAttachmentService: basket Bottom was not created")
+	if not rightHand or not rightHand:IsA("BasePart") then
+		warn("BasketAttachmentService: RightHand was not available")
 		return
 	end
 
+	local basketTargetLocalCFrame, basketAttachmentLocalCFrame =
+		getIntendedMountLocalCFrames(character, root, head)
+	local desiredBottomCFrame = root.CFrame
+		* basketTargetLocalCFrame
+		* basketAttachmentLocalCFrame:Inverse()
+	clearOldBasket(character)
+	removeOldBasketTarget(character)
+
+	local basket = Instance.new("Model")
+	basket.Name = BASKET_NAME
+	basket:SetAttribute(MOUNT_READY_ATTRIBUTE, false)
+
+	-- Bottom is an invisible mount reference. Its world CFrame, the model pivot,
+	-- and all follower constraints remain identical to the working basket.
+	local bottom = Instance.new("Part")
+	bottom.Name = "Bottom"
+	bottom.Size = Vector3.new(LOWER_OUTER_WIDTH, BOTTOM_THICKNESS, LOWER_OUTER_DEPTH)
+	configureBottomAnchor(bottom)
+	bottom.CFrame = desiredBottomCFrame
+	bottom.Parent = basket
+
 	basket.PrimaryPart = bottom
-	-- The basket is now its own physical assembly. Only the floor carries mass;
-	-- walls and the later invisible collision shell stay massless so the center
-	-- of mass remains low and stable.
 	bottom.Massless = false
-	bottom.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.55, 0, 100, 100)
-
-	for _, child in basket:GetChildren() do
-		if child:IsA("BasePart") and child ~= bottom then
-			weldParts(bottom, child, "BottomWeld")
-		end
-	end
-
-	local basketTarget = Instance.new("Attachment")
-	basketTarget.Name = BASKET_TARGET_NAME
-	basketTarget.CFrame = root.CFrame:ToObjectSpace(bottom.CFrame)
-	basketTarget.Parent = root
-
-	local basketAttachment = Instance.new("Attachment")
-	basketAttachment.Name = BASKET_ATTACHMENT_NAME
-	basketAttachment.CFrame = CFrame.identity
-	basketAttachment.Parent = bottom
-
-	local basketMass = bottom.AssemblyMass
-	local positionMaxForce = math.max(10000, basketMass * POSITION_MAX_FORCE_PER_MASS)
-	local orientationMaxTorque = math.max(
-		10000,
-		basketMass * ORIENTATION_MAX_TORQUE_PER_MASS
-	)
-
-	local alignPosition = Instance.new("AlignPosition")
-	alignPosition.Name = BASKET_POSITION_ALIGN_NAME
-	alignPosition.Mode = Enum.PositionAlignmentMode.TwoAttachment
-	alignPosition.Attachment0 = basketAttachment
-	alignPosition.Attachment1 = basketTarget
-	alignPosition.RigidityEnabled = false
-	alignPosition.ReactionForceEnabled = false
-	alignPosition.ApplyAtCenterOfMass = true
-	alignPosition.ForceLimitMode = Enum.ForceLimitMode.Magnitude
-	alignPosition.Responsiveness = POSITION_RESPONSIVENESS
-	alignPosition.MaxVelocity = POSITION_MAX_VELOCITY
-	alignPosition.MaxForce = positionMaxForce
-	alignPosition.Parent = bottom
-
-	local alignOrientation = Instance.new("AlignOrientation")
-	alignOrientation.Name = BASKET_ORIENTATION_ALIGN_NAME
-	alignOrientation.Mode = Enum.OrientationAlignmentMode.TwoAttachment
-	alignOrientation.Attachment0 = basketAttachment
-	alignOrientation.Attachment1 = basketTarget
-	alignOrientation.RigidityEnabled = false
-	alignOrientation.ReactionTorqueEnabled = false
-	alignOrientation.Responsiveness = ORIENTATION_RESPONSIVENESS
-	alignOrientation.MaxTorque = orientationMaxTorque
-	alignOrientation.Parent = bottom
+	bottom.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.32, 0, 100, 20)
+	createWovenVisualBasket(basket, bottom)
+	createHandTarget(bottom, "LeftHandContact", CFrame.new(-0.98, -0.10, 0))
+	createHandTarget(bottom, "RightHandContact", CFrame.new(0.98, -0.10, 0))
 
 	basket.Parent = character
+	local currentPivot = basket:GetPivot()
+	local bottomToPivot = bottom.CFrame:ToObjectSpace(currentPivot)
+	local desiredPivot = desiredBottomCFrame * bottomToPivot
+	basket:PivotTo(desiredPivot)
 
-	local basketOwner = Players:GetPlayerFromCharacter(character)
-	local canSetOwner, ownerReason = bottom:CanSetNetworkOwnership()
-	local ownerAssigned = false
-	if canSetOwner and basketOwner then
-		local assigned, assignmentError = pcall(function()
-			bottom:SetNetworkOwner(basketOwner)
-		end)
-		ownerAssigned = assigned
-		if not assigned then
-			ownerReason = tostring(assignmentError)
-		end
-	end
-	basket:SetAttribute(SOFT_MOUNT_READY_ATTRIBUTE, true)
-
-	local actualOwner = bottom:GetNetworkOwner()
-	print(
-		"[BasketPhysics] SoftMount",
-		"mass=" .. string.format("%.4f", bottom.AssemblyMass),
-		"maxForce=" .. string.format("%.1f", positionMaxForce),
-		"maxTorque=" .. string.format("%.1f", orientationMaxTorque),
-		"owner=" .. (actualOwner and actualOwner.Name or "server"),
-		"assigned=" .. tostring(ownerAssigned),
-		"reason=" .. tostring(ownerReason or "none"),
-		"separateAssembly=true"
-	)
+	-- Keep the intended authored placement stable until BasketHold has applied.
+	local bootstrapWeld = weldParts(root, bottom, "BasketBootstrapWeld")
 
 	-- Always clear controls left by an earlier version/hot reload. During this
 	-- test createArmIK is unreachable, so the avatar keeps its default arms.
@@ -554,13 +841,99 @@ local function attachBasket(character: Model)
 
 	playBasketHoldAnimation(character, humanoid, basket)
 
-	local function cleanUpTarget()
-		if basketTarget.Parent then
-			basketTarget:Destroy()
+	task.spawn(function()
+		for _ = 1, 6 do
+			RunService.Heartbeat:Wait()
 		end
-	end
-	basket.Destroying:Once(cleanUpTarget)
-	character.Destroying:Once(cleanUpTarget)
+		if not basket.Parent or not bottom.Parent or not rightHand.Parent then
+			return
+		end
+
+		local target = Instance.new("Attachment")
+		target.Name = BASKET_TARGET_NAME
+		target.CFrame = rightHand.CFrame:ToObjectSpace(bottom.CFrame)
+		target.Parent = rightHand
+
+		-- Position still follows the animated hand on every axis. Orientation uses
+		-- the root-relative neutral hold rotation so run/landing body lean cannot
+		-- pitch the basket floor forward and eject the eggs.
+		local orientationTarget = Instance.new("Attachment")
+		orientationTarget.Name = BASKET_ORIENTATION_TARGET_NAME
+		orientationTarget.CFrame = root.CFrame:ToObjectSpace(bottom.CFrame)
+		orientationTarget.Parent = root
+
+		local basketAttachment = Instance.new("Attachment")
+		basketAttachment.Name = BASKET_ATTACHMENT_NAME
+		basketAttachment.CFrame = CFrame.identity
+		basketAttachment.Parent = bottom
+
+		if bootstrapWeld.Parent then
+			bootstrapWeld:Destroy()
+		end
+
+		local basketMass = bottom.AssemblyMass
+		local maxAxesForce = Vector3.new(
+			basketMass * HORIZONTAL_MAX_FORCE_PER_MASS,
+			basketMass * VERTICAL_MAX_FORCE_PER_MASS,
+			basketMass * HORIZONTAL_MAX_FORCE_PER_MASS
+		)
+
+		local alignPosition = Instance.new("AlignPosition")
+		alignPosition.Name = "BasketAlignPosition"
+		alignPosition.Mode = Enum.PositionAlignmentMode.TwoAttachment
+		alignPosition.Attachment0 = basketAttachment
+		alignPosition.Attachment1 = target
+		alignPosition.RigidityEnabled = false
+		alignPosition.ReactionForceEnabled = false
+		alignPosition.ApplyAtCenterOfMass = true
+		alignPosition.ForceLimitMode = Enum.ForceLimitMode.PerAxis
+		alignPosition.ForceRelativeTo = Enum.ActuatorRelativeTo.World
+		alignPosition.MaxAxesForce = maxAxesForce
+		alignPosition.MaxVelocity = POSITION_MAX_VELOCITY
+		alignPosition.Responsiveness = POSITION_RESPONSIVENESS
+		alignPosition.Parent = bottom
+
+		local alignOrientation = Instance.new("AlignOrientation")
+		alignOrientation.Name = "BasketAlignOrientation"
+		alignOrientation.Mode = Enum.OrientationAlignmentMode.TwoAttachment
+		alignOrientation.Attachment0 = basketAttachment
+		alignOrientation.Attachment1 = orientationTarget
+		alignOrientation.RigidityEnabled = false
+		alignOrientation.ReactionTorqueEnabled = false
+		alignOrientation.MaxTorque = basketMass * ORIENTATION_MAX_TORQUE_PER_MASS
+		alignOrientation.Responsiveness = ORIENTATION_RESPONSIVENESS
+		alignOrientation.Parent = bottom
+
+		local basketOwner = Players:GetPlayerFromCharacter(character)
+		if basketOwner then
+			local canSetOwnership = bottom:CanSetNetworkOwnership()
+			if canSetOwnership then
+				pcall(function()
+					bottom:SetNetworkOwner(basketOwner)
+				end)
+			end
+		end
+
+		basket:SetAttribute(MOUNT_READY_ATTRIBUTE, true)
+		print(
+			"[BasketPhysics] HandFollowerReady",
+			"positionDriver=RightHand",
+			"levelOrientationDriver=HumanoidRootPart",
+			"separateAssembly=true",
+			"jumpVelocitySeeded=true"
+		)
+
+		local function cleanUpTarget()
+			if target.Parent then
+				target:Destroy()
+			end
+			if orientationTarget.Parent then
+				orientationTarget:Destroy()
+			end
+		end
+		basket.Destroying:Once(cleanUpTarget)
+		character.Destroying:Once(cleanUpTarget)
+	end)
 end
 
 local function onPlayerAdded(player: Player)

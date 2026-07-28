@@ -14,10 +14,16 @@
         "$ignoreUnknownInstances": true,
         "$path": "src/StarterCharacterScripts"
       },
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "$ignoreUnknownInstances": true,
+        "$path": "src/StarterPlayerScripts"
+      },
       "$properties": {
         "CameraMaxZoomDistance": 128.0,
         "CharacterBreakJointsOnDeath": false,
-        "CharacterUseJumpPower": false
+        "CharacterJumpPower": 12.0,
+        "CharacterUseJumpPower": true
       },
       "$ignoreUnknownInstances": true
     }

@@ -12,40 +12,46 @@ local EGG_GROUP = "Eggs"
 local CHARACTER_GROUP = "Characters"
 local BASKET_COLLIDER_GROUP = "EggBasket"
 local BASKET_NAME = "Basket"
-local SOFT_MOUNT_READY_ATTRIBUTE = "SoftMountReady"
+local MOUNT_READY_ATTRIBUTE = "BasketMountReady"
 local EGG_NAME = "BasketEgg"
 local COLLISION_SHELL_NAME = "EggCollisionShell"
-local EGG_COUNT = 5
-local EGG_SPAWN_DELAY = 0.1
+local SELECTED_EGG_COUNT_ATTRIBUTE = "SelectedEggCount"
+local REMOTES_FOLDER_NAME = "Remotes"
+local SET_EGG_COUNT_REMOTE_NAME = "SetEggCount"
+local MIN_EGG_COUNT = 1
+local DEFAULT_EGG_COUNT = 5
+local MAX_EGG_COUNT = 30
+local EGG_SPAWN_DELAY = 0.06
+local EGG_REBUILD_DELAY = 0.08
 
 -- Raise/lower the egg here relative to Basket.Bottom.
-local EGG_BOTTOM_CLEARANCE = 0.05
-local EGG_COLLIDER_DIAMETER = 0.5
-local EGG_PHYSICAL_PROPERTIES = PhysicalProperties.new(0.25, 0.45, 0.02, 50, 100)
+local EGG_BOTTOM_CLEARANCE = 0.015
+local EGG_COLLIDER_DIAMETER = 0.43
+local EGG_VISUAL_SCALE_FACTOR = 0.86
+local EGG_SPAWN_HORIZONTAL_GAP = 0.035
+local EGG_SPAWN_WALL_MARGIN = 0.04
+local EGG_LAYER_CLEARANCE = 0.008
+-- Real loose eggs must be able to roll when the hand-driven basket changes
+-- direction. The previous high weighted friction made a settled five-egg layer
+-- behave like one stuck cluster. Density and elasticity remain deliberately low.
+local EGG_PHYSICAL_PROPERTIES = PhysicalProperties.new(0.25, 0.28, 0.02, 50, 20)
 
--- Five non-overlapping centers inside the basket. X is left/right and Y is
--- Basket.Bottom's local Z (front/back). Keep centers at least one collider
--- diameter apart when tuning these values.
-local EGG_SPAWN_OFFSETS: { Vector2 } = {
-	Vector2.new(0, 0),
-	Vector2.new(-0.55, -0.28),
-	Vector2.new(0.55, -0.28),
-	Vector2.new(-0.55, 0.28),
-	Vector2.new(0.55, 0.28),
-}
-
--- The visible walls are only 0.18 studs thick. A character can move farther
--- than that between physics steps, so loose eggs can tunnel through them.
--- These values affect only the invisible egg-only collision shell.
-local SHELL_WALL_THICKNESS = 0.42
-local SHELL_WALL_HEIGHT = 0.82
-local SHELL_WALL_Y_OFFSET = 0.085
+-- Five-part flared collision shell. The lower and upper outer faces remain
+-- inside the visible woven silhouette; the values near the upper egg layers
+-- provide an effective interior of approximately 2.15 x 1.80 studs.
+local SHELL_LOWER_INTERIOR_WIDTH = 1.81
+local SHELL_LOWER_INTERIOR_DEPTH = 1.31
+local SHELL_UPPER_INTERIOR_WIDTH = 2.30
+local SHELL_UPPER_INTERIOR_DEPTH = 1.95
+local SHELL_USABLE_HEIGHT = 0.82
+local SHELL_WALL_THICKNESS = 0.12
 -- Keep the top surface exactly aligned with the visible basket floor, but make
 -- the invisible egg-only floor deep enough that a newly network-owned 0.5-stud
 -- collider cannot tunnel through it during character spawn/settling.
-local SHELL_FLOOR_THICKNESS = 1.20
+local SHELL_FLOOR_THICKNESS = 2.40
 
 local activeEggs: { [Model]: { Model } } = {}
+local spawnGeneration: { [Player]: number } = {}
 local LEGACY_VERTICAL_STABILIZER_NAME = "EggVerticalStabilizer"
 
 local FORBIDDEN_PHYSICS_CLASSES: { [string]: boolean } = {
@@ -138,7 +144,53 @@ local function configureBasketCollider(part: Part)
 	part.CollisionGroup = BASKET_COLLIDER_GROUP
 	part.TopSurface = Enum.SurfaceType.Smooth
 	part.BottomSurface = Enum.SurfaceType.Smooth
-	part.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.65, 0, 100, 100)
+	part.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.32, 0, 100, 20)
+end
+
+local function createShellPart(
+	name: string,
+	size: Vector3,
+	localCFrame: CFrame,
+	shell: Model,
+	bottom: BasePart
+): Part
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Size = size
+	configureBasketCollider(part)
+	part.CFrame = bottom.CFrame * localCFrame
+	part.Parent = shell
+
+	local weld = Instance.new("WeldConstraint")
+	weld.Name = "BasketColliderWeld"
+	weld.Part0 = bottom
+	weld.Part1 = part
+	weld.Parent = part
+	return part
+end
+
+local function frontBackWallLocalCFrame(zSign: number, floorLocalY: number): (CFrame, number)
+	local lowerZ = zSign * (SHELL_LOWER_INTERIOR_DEPTH * 0.5 + SHELL_WALL_THICKNESS * 0.5)
+	local upperZ = zSign * (SHELL_UPPER_INTERIOR_DEPTH * 0.5 + SHELL_WALL_THICKNESS * 0.5)
+	local lowerPoint = Vector3.new(0, floorLocalY, lowerZ)
+	local upperPoint = Vector3.new(0, floorLocalY + SHELL_USABLE_HEIGHT, upperZ)
+	local yAxis = (upperPoint - lowerPoint).Unit
+	local xAxis = Vector3.xAxis
+	local zAxis = xAxis:Cross(yAxis).Unit
+	return CFrame.fromMatrix((lowerPoint + upperPoint) * 0.5, xAxis, yAxis, zAxis),
+		(upperPoint - lowerPoint).Magnitude
+end
+
+local function leftRightWallLocalCFrame(xSign: number, floorLocalY: number): (CFrame, number)
+	local lowerX = xSign * (SHELL_LOWER_INTERIOR_WIDTH * 0.5 + SHELL_WALL_THICKNESS * 0.5)
+	local upperX = xSign * (SHELL_UPPER_INTERIOR_WIDTH * 0.5 + SHELL_WALL_THICKNESS * 0.5)
+	local lowerPoint = Vector3.new(lowerX, floorLocalY, 0)
+	local upperPoint = Vector3.new(upperX, floorLocalY + SHELL_USABLE_HEIGHT, 0)
+	local yAxis = (upperPoint - lowerPoint).Unit
+	local zAxis = Vector3.zAxis
+	local xAxis = yAxis:Cross(zAxis).Unit
+	return CFrame.fromMatrix((lowerPoint + upperPoint) * 0.5, xAxis, yAxis, zAxis),
+		(upperPoint - lowerPoint).Magnitude
 end
 
 local function addBasketCollisionShell(basket: Model, bottom: BasePart): Model
@@ -149,51 +201,216 @@ local function addBasketCollisionShell(basket: Model, bottom: BasePart): Model
 
 	local shell = Instance.new("Model")
 	shell.Name = COLLISION_SHELL_NAME
+	shell.Parent = basket
+	local floorLocalY = bottom.Size.Y * 0.5
+	local rimLocalY = floorLocalY + SHELL_USABLE_HEIGHT
+	shell:SetAttribute("FloorLocalY", floorLocalY)
+	shell:SetAttribute("RimLocalY", rimLocalY)
+	shell:SetAttribute("LowerInteriorWidth", SHELL_LOWER_INTERIOR_WIDTH)
+	shell:SetAttribute("LowerInteriorDepth", SHELL_LOWER_INTERIOR_DEPTH)
+	shell:SetAttribute("UpperInteriorWidth", SHELL_UPPER_INTERIOR_WIDTH)
+	shell:SetAttribute("UpperInteriorDepth", SHELL_UPPER_INTERIOR_DEPTH)
 
-	for _, name in { "Bottom", "FrontWall", "BackWall", "LeftWall", "RightWall" } do
-		local visiblePart = basket:FindFirstChild(name)
-		if visiblePart and visiblePart:IsA("BasePart") then
-			local collisionPart = Instance.new("Part")
-			collisionPart.Name = name .. "Collider"
+	-- The thick floor extends downward only; its top stays exactly at the visible
+	-- BottomPanel surface. This retains the existing anti-tunnelling protection.
+	createShellPart(
+		"BottomCollider",
+		Vector3.new(
+			SHELL_LOWER_INTERIOR_WIDTH + SHELL_WALL_THICKNESS,
+			SHELL_FLOOR_THICKNESS,
+			SHELL_LOWER_INTERIOR_DEPTH + SHELL_WALL_THICKNESS
+		),
+		CFrame.new(0, floorLocalY - SHELL_FLOOR_THICKNESS * 0.5, 0),
+		shell,
+		bottom
+	)
 
-			if name == "Bottom" then
-				-- Keep the collision surface aligned with the visible floor top.
-				collisionPart.Size = Vector3.new(
-					visiblePart.Size.X,
-					SHELL_FLOOR_THICKNESS,
-					visiblePart.Size.Z
-				)
-				local downwardOffset = (SHELL_FLOOR_THICKNESS - visiblePart.Size.Y) * 0.5
-				collisionPart.CFrame = visiblePart.CFrame * CFrame.new(0, -downwardOffset, 0)
-			elseif name == "FrontWall" or name == "BackWall" then
-				collisionPart.Size = Vector3.new(
-					visiblePart.Size.X + SHELL_WALL_THICKNESS,
-					SHELL_WALL_HEIGHT,
-					SHELL_WALL_THICKNESS
-				)
-				collisionPart.CFrame = visiblePart.CFrame * CFrame.new(0, SHELL_WALL_Y_OFFSET, 0)
-			else
-				collisionPart.Size = Vector3.new(
-					SHELL_WALL_THICKNESS,
-					SHELL_WALL_HEIGHT,
-					visiblePart.Size.Z + SHELL_WALL_THICKNESS
-				)
-				collisionPart.CFrame = visiblePart.CFrame * CFrame.new(0, SHELL_WALL_Y_OFFSET, 0)
-			end
+	local frontCFrame, frontLength = frontBackWallLocalCFrame(-1, floorLocalY)
+	local backCFrame, backLength = frontBackWallLocalCFrame(1, floorLocalY)
+	local leftCFrame, leftLength = leftRightWallLocalCFrame(-1, floorLocalY)
+	local rightCFrame, rightLength = leftRightWallLocalCFrame(1, floorLocalY)
+	-- Keep each rectangular wall span within the narrow lower silhouette. The
+	-- perpendicular walls overlap enough that the remaining corner openings are
+	-- much smaller than the unchanged 0.43-stud egg collider.
+	local collisionWallSpanWidth = SHELL_LOWER_INTERIOR_WIDTH
+		+ SHELL_WALL_THICKNESS * 2
+	local collisionWallSpanDepth = SHELL_LOWER_INTERIOR_DEPTH
+		+ SHELL_WALL_THICKNESS * 2
 
-			configureBasketCollider(collisionPart)
-			collisionPart.Parent = shell
+	createShellPart(
+		"FrontWallCollider",
+		Vector3.new(collisionWallSpanWidth, frontLength, SHELL_WALL_THICKNESS),
+		frontCFrame,
+		shell,
+		bottom
+	)
+	createShellPart(
+		"BackWallCollider",
+		Vector3.new(collisionWallSpanWidth, backLength, SHELL_WALL_THICKNESS),
+		backCFrame,
+		shell,
+		bottom
+	)
+	createShellPart(
+		"LeftWallCollider",
+		Vector3.new(SHELL_WALL_THICKNESS, leftLength, collisionWallSpanDepth),
+		leftCFrame,
+		shell,
+		bottom
+	)
+	createShellPart(
+		"RightWallCollider",
+		Vector3.new(SHELL_WALL_THICKNESS, rightLength, collisionWallSpanDepth),
+		rightCFrame,
+		shell,
+		bottom
+	)
+	return shell
+end
 
-			local weld = Instance.new("WeldConstraint")
-			weld.Name = "BasketColliderWeld"
-			weld.Part0 = bottom
-			weld.Part1 = collisionPart
-			weld.Parent = collisionPart
-		end
+type SpawnLayout = {
+	positions: { Vector3 },
+	interiorWidth: number,
+	interiorDepth: number,
+	interiorHeight: number,
+	rimLocalY: number,
+	positionsPerLayer: number,
+}
+
+local function validateEggCount(value: any): number?
+	if typeof(value) ~= "number"
+		or value ~= value
+		or math.abs(value) == math.huge
+		or value % 1 ~= 0
+		or value < MIN_EGG_COUNT
+		or value > MAX_EGG_COUNT
+	then
+		return nil
+	end
+	return value
+end
+
+local function getSelectedEggCount(player: Player): number
+	local selected = validateEggCount(player:GetAttribute(SELECTED_EGG_COUNT_ATTRIBUTE))
+	if selected then
+		return selected
+	end
+	player:SetAttribute(SELECTED_EGG_COUNT_ATTRIBUTE, DEFAULT_EGG_COUNT)
+	return DEFAULT_EGG_COUNT
+end
+
+local function generateSpawnLayout(
+	bottom: BasePart,
+	shell: Model,
+	requestedCount: number
+): SpawnLayout
+	local floorLocalY = shell:GetAttribute("FloorLocalY")
+	local rimLocalY = shell:GetAttribute("RimLocalY")
+	local lowerWidth = shell:GetAttribute("LowerInteriorWidth")
+	local lowerDepth = shell:GetAttribute("LowerInteriorDepth")
+	local upperWidth = shell:GetAttribute("UpperInteriorWidth")
+	local upperDepth = shell:GetAttribute("UpperInteriorDepth")
+	if typeof(floorLocalY) ~= "number" then
+		floorLocalY = bottom.Size.Y * 0.5
+	end
+	if typeof(rimLocalY) ~= "number" then
+		rimLocalY = floorLocalY + SHELL_USABLE_HEIGHT
+	end
+	if typeof(lowerWidth) ~= "number" then
+		lowerWidth = SHELL_LOWER_INTERIOR_WIDTH
+	end
+	if typeof(lowerDepth) ~= "number" then
+		lowerDepth = SHELL_LOWER_INTERIOR_DEPTH
+	end
+	if typeof(upperWidth) ~= "number" then
+		upperWidth = SHELL_UPPER_INTERIOR_WIDTH
+	end
+	if typeof(upperDepth) ~= "number" then
+		upperDepth = SHELL_UPPER_INTERIOR_DEPTH
 	end
 
-	shell.Parent = basket
-	return shell
+	local typedFloorLocalY = floorLocalY :: number
+	local typedRimLocalY = rimLocalY :: number
+	local typedLowerWidth = lowerWidth :: number
+	local typedLowerDepth = lowerDepth :: number
+	local typedUpperWidth = upperWidth :: number
+	local typedUpperDepth = upperDepth :: number
+	local radius = EGG_COLLIDER_DIAMETER * 0.5
+	local horizontalSpacing = EGG_COLLIDER_DIAMETER + EGG_SPAWN_HORIZONTAL_GAP
+	local halfCellDiagonal = math.sqrt(2) * horizontalSpacing * 0.5
+	local minimumVerticalSeparation = EGG_COLLIDER_DIAMETER * 0.55
+	local layerSpacing = math.sqrt(math.max(
+		EGG_COLLIDER_DIAMETER ^ 2 - halfCellDiagonal ^ 2,
+		minimumVerticalSeparation ^ 2
+	)) + EGG_LAYER_CLEARANCE
+	local firstCenterY = typedFloorLocalY + radius + EGG_BOTTOM_CLEARANCE
+	local firstLayerAlpha = math.clamp(
+		(firstCenterY - typedFloorLocalY)
+			/ math.max(typedRimLocalY - typedFloorLocalY, 0.001),
+		0,
+		1
+	)
+	local firstLayerWidth = typedLowerWidth
+		+ (typedUpperWidth - typedLowerWidth) * firstLayerAlpha
+	local firstLayerDepth = typedLowerDepth
+		+ (typedUpperDepth - typedLowerDepth) * firstLayerAlpha
+	local firstLayerSafeWidth = math.max(
+		firstLayerWidth - EGG_COLLIDER_DIAMETER - EGG_SPAWN_WALL_MARGIN * 2,
+		0
+	)
+	local firstLayerSafeDepth = math.max(
+		firstLayerDepth - EGG_COLLIDER_DIAMETER - EGG_SPAWN_WALL_MARGIN * 2,
+		0
+	)
+	-- Fix the horizontal lattice from the lowest/narrowest layer. Reusing that
+	-- lattice above prevents a wider upper layer from changing phase and causing
+	-- cross-layer overlap during the sequential 12-6-12 spawn.
+	local columns = math.max(1, math.floor(firstLayerSafeWidth / horizontalSpacing) + 1)
+	local rows = math.max(1, math.floor(firstLayerSafeDepth / horizontalSpacing) + 1)
+	local positions: { Vector3 } = {}
+	local layerIndex = 0
+	local positionsPerLayer = columns * rows
+
+	while #positions < requestedCount do
+		local y = firstCenterY + layerIndex * layerSpacing
+		local usedWidth = (columns - 1) * horizontalSpacing
+		local usedDepth = (rows - 1) * horizontalSpacing
+		local centeredStartX = -usedWidth * 0.5
+		local centeredStartZ = -usedDepth * 0.5
+		local usePocketLayer = layerIndex % 2 == 1 and columns > 1 and rows > 1
+		local layerColumns = if usePocketLayer then columns - 1 else columns
+		local layerRows = if usePocketLayer then rows - 1 else rows
+		local cellOffset = if usePocketLayer then 0.5 else 0
+
+		for row = 0, layerRows - 1 do
+			for column = 0, layerColumns - 1 do
+				if #positions >= requestedCount then
+					break
+				end
+				local x = centeredStartX + (column + cellOffset) * horizontalSpacing
+				local z = centeredStartZ + (row + cellOffset) * horizontalSpacing
+				table.insert(positions, Vector3.new(x, y, z))
+			end
+		end
+		layerIndex += 1
+	end
+
+	-- Report the usable opening dimensions. The lower shell is deliberately
+	-- narrower and expands continuously to these values at the rim.
+	local effectiveHeightAlpha = 1
+	local effectiveInteriorWidth = typedLowerWidth
+		+ (typedUpperWidth - typedLowerWidth) * effectiveHeightAlpha
+	local effectiveInteriorDepth = typedLowerDepth
+		+ (typedUpperDepth - typedLowerDepth) * effectiveHeightAlpha
+
+	return {
+		positions = positions,
+		interiorWidth = effectiveInteriorWidth,
+		interiorDepth = effectiveInteriorDepth,
+		interiorHeight = math.max(typedRimLocalY - typedFloorLocalY, 0),
+		rimLocalY = typedRimLocalY,
+		positionsPerLayer = positionsPerLayer,
+	}
 end
 
 local function cleanUpEggs(character: Model)
@@ -206,6 +423,23 @@ local function cleanUpEggs(character: Model)
 			end
 		end
 	end
+end
+
+local function cleanUpOwnedWorkspaceEggs(player: Player)
+	for _, child in Workspace:GetChildren() do
+		if child:IsA("Model")
+			and child:GetAttribute("IsBasketEgg") == true
+			and child:GetAttribute("OwnerUserId") == player.UserId
+		then
+			child:Destroy()
+		end
+	end
+end
+
+local function invalidatePlayerSpawn(player: Player): number
+	local generation = (spawnGeneration[player] or 0) + 1
+	spawnGeneration[player] = generation
+	return generation
 end
 
 local function removeStaleRuntimeEggs()
@@ -264,6 +498,14 @@ local function configureCleanEggAssembly(egg: Model): (Part?, boolean)
 	visual.Massless = true
 	visual.CollisionGroup = EGG_GROUP
 
+	local visualMesh = visual:FindFirstChildOfClass("SpecialMesh")
+	if visualMesh then
+		visualMesh.Scale = visualMesh.Scale * EGG_VISUAL_SCALE_FACTOR
+		visualMesh.Offset = visualMesh.Offset * EGG_VISUAL_SCALE_FACTOR
+	else
+		visual.Size = visual.Size * EGG_VISUAL_SCALE_FACTOR
+	end
+
 	local existingVisualWeld = visual:FindFirstChild("VisualWeld")
 	local visualWeld: WeldConstraint
 	if existingVisualWeld and existingVisualWeld:IsA("WeldConstraint") then
@@ -296,9 +538,12 @@ local function getAssemblyPartCount(collider: BasePart): number
 	return count
 end
 
-local function spawnEggsInBasket(character: Model)
-	cleanUpEggs(character)
-
+local function spawnEggsInBasket(
+	player: Player,
+	character: Model,
+	requestedCount: number,
+	generation: number
+)
 	local basket = character:WaitForChild(BASKET_NAME, 15)
 	if not basket or not basket:IsA("Model") then
 		warn("EggBasketSpawnService: runtime Basket was not available")
@@ -311,21 +556,21 @@ local function spawnEggsInBasket(character: Model)
 		return
 	end
 
-	-- Do not add a collision shell or loose eggs until the basket has become its
-	-- own player-owned assembly and both soft constraints are configured.
+	-- Do not add the collision shell or loose eggs until the rigid root mount is ready.
 	local readyDeadline = os.clock() + 3
-	while basket:GetAttribute(SOFT_MOUNT_READY_ATTRIBUTE) ~= true
+	while basket:GetAttribute(MOUNT_READY_ATTRIBUTE) ~= true
 		and basket.Parent
 		and os.clock() < readyDeadline
 	do
 		RunService.Heartbeat:Wait()
 	end
-	if basket:GetAttribute(SOFT_MOUNT_READY_ATTRIBUTE) ~= true then
-		warn("EggBasketSpawnService: soft basket mount was not ready")
+	if basket:GetAttribute(MOUNT_READY_ATTRIBUTE) ~= true then
+		warn("EggBasketSpawnService: rigid root basket mount was not ready")
 		return
 	end
 
-	addBasketCollisionShell(basket, bottom)
+	local shell = addBasketCollisionShell(basket, bottom)
+	local layout = generateSpawnLayout(bottom, shell, requestedCount)
 
 	local template = ServerStorage:FindFirstChild("EggPhysicsTemplate")
 	if not template or not template:IsA("Model") then
@@ -333,37 +578,33 @@ local function spawnEggsInBasket(character: Model)
 		return
 	end
 
-	local networkOwner = Players:GetPlayerFromCharacter(character)
+	if Players:GetPlayerFromCharacter(character) ~= player then
+		warn("EggBasketSpawnService: player owner was not available")
+		return
+	end
 	local eggs: { Model } = {}
 	activeEggs[character] = eggs
+	local ownershipAssignedCount = 0
+	local forbiddenMovementRemovedCount = 0
+	local firstAssemblyPartCount: number? = nil
 
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	if humanoid then
-		humanoid.Died:Once(function()
-			cleanUpEggs(character)
-		end)
-	end
-
-	basket.Destroying:Once(function()
-		cleanUpEggs(character)
-	end)
-	character.Destroying:Once(function()
-		cleanUpEggs(character)
-	end)
-
-	for index = 1, EGG_COUNT do
-		local offset = EGG_SPAWN_OFFSETS[index]
+	for index = 1, requestedCount do
+		local localSpawnPosition = layout.positions[index]
 		-- A death, respawn, basket removal, or second spawn request invalidates
 		-- this set immediately, so the delayed loop cannot create duplicates.
-		if activeEggs[character] ~= eggs or not character.Parent or not basket.Parent then
+		if spawnGeneration[player] ~= generation
+			or player.Character ~= character
+			or activeEggs[character] ~= eggs
+			or not character.Parent
+			or not basket.Parent
+		then
 			break
 		end
 
 		local egg = template:Clone()
 		egg.Name = EGG_NAME .. "_" .. tostring(index)
-		if networkOwner then
-			egg:SetAttribute("EggOwnerUserId", networkOwner.UserId)
-		end
+		egg:SetAttribute("OwnerUserId", player.UserId)
+		egg:SetAttribute("IsBasketEgg", true)
 		egg:SetAttribute("EggIndex", index)
 
 		local collider, forbiddenMovementRemoved = configureCleanEggAssembly(egg)
@@ -373,96 +614,70 @@ local function spawnEggsInBasket(character: Model)
 			warn("EggBasketSpawnService: clean Collider/Visual assembly was not available")
 			return
 		end
-		local spawnHeight = bottom.Size.Y * 0.5 + collider.Size.Y * 0.5 + EGG_BOTTOM_CLEARANCE
 		-- This is the egg's only scripted movement, performed before it enters
 		-- Workspace. From this point onward the basket and Roblox physics move it.
-		egg:PivotTo(bottom.CFrame * CFrame.new(offset.X, spawnHeight, offset.Y))
+		egg:PivotTo(bottom.CFrame * CFrame.new(localSpawnPosition))
 		egg.Parent = Workspace
 		table.insert(eggs, egg)
+		if forbiddenMovementRemoved then
+			forbiddenMovementRemovedCount += 1
+		end
+		if firstAssemblyPartCount == nil then
+			firstAssemblyPartCount = getAssemblyPartCount(collider)
+		end
 
 		local canSetOwnership, ownershipReason = collider:CanSetNetworkOwnership()
-		local ownershipAssigned = false
-		if canSetOwnership and networkOwner then
+		if canSetOwnership then
 			local assigned, assignmentError = pcall(function()
-				collider:SetNetworkOwner(networkOwner)
+				collider:SetNetworkOwner(player)
 			end)
-			ownershipAssigned = assigned
-			if not assigned then
+			if assigned then
+				ownershipAssignedCount += 1
+			else
 				ownershipReason = tostring(assignmentError)
 			end
 		end
+		if not canSetOwnership or collider:GetNetworkOwner() ~= player then
+			warn(
+				"[EggSelection] Network ownership failed",
+				"egg=" .. tostring(index),
+				"reason=" .. tostring(ownershipReason or "unknown")
+			)
+		end
 
-		local actualOwner = collider:GetNetworkOwner()
-		print(
-			"[EggPhysics] NetworkOwner",
-			"egg=" .. tostring(index) .. "/" .. tostring(EGG_COUNT),
-			"requested=" .. (networkOwner and networkOwner.Name or "none"),
-			"canSet=" .. tostring(canSetOwnership),
-			"assigned=" .. tostring(ownershipAssigned),
-			"actual=" .. (actualOwner and actualOwner.Name or "server"),
-			"reason=" .. tostring(ownershipReason or "none")
-		)
-		print("[EggPhysics] AssemblyPartCount", "egg=" .. tostring(index), getAssemblyPartCount(collider))
-		print("[EggPhysics] ForbiddenMovementRemoved", "egg=" .. tostring(index), forbiddenMovementRemoved)
-
-		if index < EGG_COUNT then
+		if index < requestedCount then
 			task.wait(EGG_SPAWN_DELAY)
 		end
 	end
 
-	print("[EggPhysics] ActiveEggCount", #eggs)
-	if RunService:IsStudio() and humanoid then
-		local jumpObserved = false
-		local retentionConnection: RBXScriptConnection
-		retentionConnection = humanoid.StateChanged:Connect(function(
-			_previousState: Enum.HumanoidStateType,
-			newState: Enum.HumanoidStateType
-		)
-			if newState == Enum.HumanoidStateType.Jumping then
-				jumpObserved = true
-			elseif jumpObserved and newState == Enum.HumanoidStateType.Landed then
-				jumpObserved = false
-				task.delay(0.35, function()
-					if activeEggs[character] ~= eggs or not bottom.Parent then
-						return
-					end
-
-					local insideCount = 0
-					for _, egg in eggs do
-						local collider = egg:FindFirstChild("Collider")
-						if collider and collider:IsA("BasePart") and collider.Parent then
-							local localPosition = bottom.CFrame:PointToObjectSpace(collider.Position)
-							if math.abs(localPosition.X) <= bottom.Size.X * 0.5
-								and math.abs(localPosition.Z) <= bottom.Size.Z * 0.5
-								and localPosition.Y >= 0
-								and localPosition.Y <= 0.9
-							then
-								insideCount += 1
-							end
-						end
-					end
-					print(
-						"[EggPhysics] PostJumpRetention",
-						"inside=" .. tostring(insideCount),
-						"total=" .. tostring(#eggs)
-					)
-				end)
-			end
-		end)
-		character.Destroying:Once(function()
-			retentionConnection:Disconnect()
-		end)
+	if spawnGeneration[player] ~= generation or activeEggs[character] ~= eggs then
+		return
 	end
+	print(
+		"[EggSelection] SpawnComplete",
+		"player=" .. player.Name,
+		"requested=" .. tostring(requestedCount),
+		"active=" .. tostring(#eggs),
+		"networkOwned=" .. tostring(ownershipAssignedCount),
+		"positionsPerLayer=" .. tostring(layout.positionsPerLayer),
+		"assemblyParts=" .. tostring(firstAssemblyPartCount or 0),
+		"forbiddenMovementRemoved=" .. tostring(forbiddenMovementRemovedCount)
+	)
+
 	task.delay(2, function()
-		if activeEggs[character] ~= eggs or not bottom.Parent then
+		if spawnGeneration[player] ~= generation
+			or activeEggs[character] ~= eggs
+			or not bottom.Parent
+		then
 			return
 		end
 
-		local rimLocalY = bottom.Size.Y * 0.5 + 0.65
 		local highestEggTop = -math.huge
+		local activeCount = 0
 		for _, egg in eggs do
 			local collider = egg:FindFirstChild("Collider")
 			if collider and collider:IsA("BasePart") and collider.Parent then
+				activeCount += 1
 				local localCenter = bottom.CFrame:PointToObjectSpace(collider.Position)
 				highestEggTop = math.max(
 					highestEggTop,
@@ -473,51 +688,137 @@ local function spawnEggsInBasket(character: Model)
 
 		if highestEggTop > -math.huge then
 			print(
-				"[EggPhysics] Capacity",
-				"interiorHeight=0.650",
+				"[EggSelection] Capacity",
+				"requested=" .. tostring(requestedCount),
+				"active=" .. tostring(activeCount),
+				"interiorWidth=" .. string.format("%.3f", layout.interiorWidth),
+				"interiorDepth=" .. string.format("%.3f", layout.interiorDepth),
+				"interiorHeight=" .. string.format("%.3f", layout.interiorHeight),
 				"colliderDiameter=" .. string.format("%.3f", EGG_COLLIDER_DIAMETER),
-				"highestClearance=" .. string.format("%.3f", rimLocalY - highestEggTop)
+				"highestClearance=" .. string.format("%.3f", layout.rimLocalY - highestEggTop),
+				"belowRim=" .. tostring(highestEggTop <= layout.rimLocalY)
 			)
 		end
 	end)
-	task.delay(1, function()
-		if bottom.Parent then
-			local upDot = math.clamp(bottom.CFrame.UpVector:Dot(Vector3.yAxis), -1, 1)
-			local tiltDegrees = math.deg(math.acos(upDot))
-			local localGravity = bottom.CFrame:VectorToObjectSpace(Vector3.new(0, -1, 0))
-			print(
-				"[EggPhysics] BasketTilt",
-				string.format("degrees=%.3f", tiltDegrees),
-				string.format("localDownhillX=%.4f", localGravity.X),
-				string.format("localDownhillZ=%.4f", localGravity.Z)
-			)
-		end
-	end)
-
 end
 
-local function onCharacterAdded(character: Model)
+local function requestEggRebuild(player: Player)
+	local generation = invalidatePlayerSpawn(player)
+	local character = player.Character
+	if not character then
+		cleanUpOwnedWorkspaceEggs(player)
+		return
+	end
+
+	cleanUpEggs(character)
+	cleanUpOwnedWorkspaceEggs(player)
+	local requestedCount = getSelectedEggCount(player)
+	task.spawn(function()
+		task.wait(EGG_REBUILD_DELAY)
+		if spawnGeneration[player] ~= generation or player.Character ~= character then
+			return
+		end
+		spawnEggsInBasket(player, character, requestedCount, generation)
+	end)
+end
+
+local function onCharacterAdded(player: Player, character: Model)
 	removeLegacyEggVerticalStabilizer(character)
 	applyCharacterCollisionGroup(character)
-	task.spawn(spawnEggsInBasket, character)
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if humanoid then
+		humanoid.Died:Once(function()
+			invalidatePlayerSpawn(player)
+			cleanUpEggs(character)
+			cleanUpOwnedWorkspaceEggs(player)
+		end)
+	end
+	character.Destroying:Once(function()
+		cleanUpEggs(character)
+	end)
+	task.defer(requestEggRebuild, player)
 end
 
 local function onPlayerAdded(player: Player)
-	player.CharacterAdded:Connect(onCharacterAdded)
-	player.CharacterRemoving:Connect(cleanUpEggs)
+	getSelectedEggCount(player)
+	player.CharacterAdded:Connect(function(character: Model)
+		onCharacterAdded(player, character)
+	end)
+	player.CharacterRemoving:Connect(function(character: Model)
+		invalidatePlayerSpawn(player)
+		cleanUpEggs(character)
+		cleanUpOwnedWorkspaceEggs(player)
+	end)
 
 	if player.Character then
-		task.spawn(onCharacterAdded, player.Character)
+		task.spawn(onCharacterAdded, player, player.Character)
 	end
+end
+
+local function getOrCreateSetEggCountRemote(): RemoteEvent
+	local remotes = ReplicatedStorage:FindFirstChild(REMOTES_FOLDER_NAME)
+	if remotes and not remotes:IsA("Folder") then
+		remotes:Destroy()
+		remotes = nil
+	end
+	if not remotes then
+		remotes = Instance.new("Folder")
+		remotes.Name = REMOTES_FOLDER_NAME
+		remotes.Parent = ReplicatedStorage
+	end
+
+	local existing = remotes:FindFirstChild(SET_EGG_COUNT_REMOTE_NAME)
+	if existing and existing:IsA("RemoteEvent") then
+		return existing
+	elseif existing then
+		existing:Destroy()
+	end
+
+	local remote = Instance.new("RemoteEvent")
+	remote.Name = SET_EGG_COUNT_REMOTE_NAME
+	remote.Parent = remotes
+	return remote
 end
 
 configureCollisionGroups()
 removeHybridExperimentRemnants()
 removeLegacyEggVerticalStabilizer(StarterPlayer.StarterCharacterScripts)
 removeStaleRuntimeEggs()
+local setEggCountRemote = getOrCreateSetEggCountRemote()
+setEggCountRemote.OnServerEvent:Connect(function(player: Player, requestedValue: any)
+	local requestedCount = validateEggCount(requestedValue)
+	if not requestedCount then
+		warn(
+			"[EggSelection] Rejected invalid count",
+			"player=" .. player.Name,
+			"value=" .. tostring(requestedValue)
+		)
+		return
+	end
+
+	if getSelectedEggCount(player) == requestedCount then
+		return
+	end
+	player:SetAttribute(SELECTED_EGG_COUNT_ATTRIBUTE, requestedCount)
+	requestEggRebuild(player)
+end)
+
+Players.PlayerRemoving:Connect(function(player: Player)
+	invalidatePlayerSpawn(player)
+	if player.Character then
+		cleanUpEggs(player.Character)
+	end
+	cleanUpOwnedWorkspaceEggs(player)
+	spawnGeneration[player] = nil
+end)
+
 print(
-	"[EggPhysics] NativeFiveEggs",
-	"eggCount=" .. tostring(EGG_COUNT),
+	"[EggSelection] Ready",
+	"default=" .. tostring(DEFAULT_EGG_COUNT),
+	"minimum=" .. tostring(MIN_EGG_COUNT),
+	"maximum=" .. tostring(MAX_EGG_COUNT),
+	"spawnDelay=" .. tostring(EGG_SPAWN_DELAY),
 	"perEggForces=false"
 )
 Players.PlayerAdded:Connect(onPlayerAdded)
