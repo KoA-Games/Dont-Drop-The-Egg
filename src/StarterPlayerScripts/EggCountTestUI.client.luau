@@ -12,7 +12,6 @@ local MIN_EGG_COUNT = 1
 local MAX_EGG_COUNT = 30
 local DEFAULT_EGG_COUNT = 5
 local SELECTED_EGG_COUNT_ATTRIBUTE = "SelectedEggCount"
-local REMAINING_EGG_COUNT_ATTRIBUTE = "RemainingEggCount"
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
@@ -142,15 +141,10 @@ local selectedAttribute = player:GetAttribute(SELECTED_EGG_COUNT_ATTRIBUTE)
 local currentCount = if typeof(selectedAttribute) == "number"
 	then math.clamp(math.floor(selectedAttribute), MIN_EGG_COUNT, MAX_EGG_COUNT)
 	else DEFAULT_EGG_COUNT
-local remainingAttribute = player:GetAttribute(REMAINING_EGG_COUNT_ATTRIBUTE)
-local remainingCount = if typeof(remainingAttribute) == "number"
-	then math.max(0, math.floor(remainingAttribute))
-	else 0
 local pendingCount = currentCount
 
 local function render()
-	currentLabel.Text = "Loaded: " .. tostring(currentCount)
-		.. "    Remaining: " .. tostring(remainingCount)
+	currentLabel.Text = "Current: " .. tostring(currentCount)
 	pendingLabel.Text = tostring(pendingCount)
 end
 
@@ -173,14 +167,6 @@ player:GetAttributeChangedSignal(SELECTED_EGG_COUNT_ATTRIBUTE):Connect(function(
 	if typeof(value) == "number" then
 		currentCount = math.clamp(math.floor(value), MIN_EGG_COUNT, MAX_EGG_COUNT)
 		pendingCount = currentCount
-		render()
-	end
-end)
-
-player:GetAttributeChangedSignal(REMAINING_EGG_COUNT_ATTRIBUTE):Connect(function()
-	local value = player:GetAttribute(REMAINING_EGG_COUNT_ATTRIBUTE)
-	if typeof(value) == "number" then
-		remainingCount = math.max(0, math.floor(value))
 		render()
 	end
 end)

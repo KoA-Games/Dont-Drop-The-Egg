@@ -1,13 +1,11 @@
 --!strict
 
 local Players = game:GetService("Players")
-local Debris = game:GetService("Debris")
 local PhysicsService = game:GetService("PhysicsService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local ServerStorage = game:GetService("ServerStorage")
 local StarterPlayer = game:GetService("StarterPlayer")
-local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 
 local EGG_GROUP = "Eggs"
@@ -18,7 +16,6 @@ local MOUNT_READY_ATTRIBUTE = "BasketMountReady"
 local EGG_NAME = "BasketEgg"
 local COLLISION_SHELL_NAME = "EggCollisionShell"
 local SELECTED_EGG_COUNT_ATTRIBUTE = "SelectedEggCount"
-local REMAINING_EGG_COUNT_ATTRIBUTE = "RemainingEggCount"
 local REMOTES_FOLDER_NAME = "Remotes"
 local SET_EGG_COUNT_REMOTE_NAME = "SetEggCount"
 local MIN_EGG_COUNT = 1
@@ -26,11 +23,6 @@ local DEFAULT_EGG_COUNT = 5
 local MAX_EGG_COUNT = 30
 local EGG_SPAWN_DELAY = 0.06
 local EGG_REBUILD_DELAY = 0.08
-local SHELL_FRAGMENT_LIFETIME = 15
-local SHELL_FRAGMENT_COUNT = 12
-local EGG_WHITE_BLOB_MIN = 4
-local EGG_WHITE_BLOB_MAX = 6
-local EGG_WHITE_SPREAD_TIME = 1.6
 
 -- Raise/lower the egg here relative to Basket.Bottom.
 local EGG_BOTTOM_CLEARANCE = 0.015
@@ -52,7 +44,7 @@ local SHELL_LOWER_INTERIOR_DEPTH = 1.31
 local SHELL_UPPER_INTERIOR_WIDTH = 2.30
 local SHELL_UPPER_INTERIOR_DEPTH = 1.95
 local SHELL_USABLE_HEIGHT = 0.82
-local SHELL_WALL_THICKNESS = 0.12
+local SHELL_WALL_THICKNESS = 0.36
 -- Keep the top surface exactly aligned with the visible basket floor, but make
 -- the invisible egg-only floor deep enough that a newly network-owned 0.5-stud
 -- collider cannot tunnel through it during character spawn/settling.
@@ -61,22 +53,6 @@ local SHELL_FLOOR_THICKNESS = 2.40
 local activeEggs: { [Model]: { Model } } = {}
 local spawnGeneration: { [Player]: number } = {}
 local LEGACY_VERTICAL_STABILIZER_NAME = "EggVerticalStabilizer"
-
-type EggRuntime = {
-	player: Player,
-	character: Model,
-	basket: Model,
-	bottom: BasePart,
-	egg: Model,
-	collider: BasePart,
-	eggs: { Model },
-	state: string,
-	hasDescended: boolean,
-	touchConnection: RBXScriptConnection?,
-}
-
-local eggRuntimes: { [Model]: EggRuntime } = {}
-local breakRandom = Random.new()
 
 local FORBIDDEN_PHYSICS_CLASSES: { [string]: boolean } = {
 	AlignPosition = true,
@@ -437,356 +413,15 @@ local function generateSpawnLayout(
 	}
 end
 
-local function removeEggRuntime(egg: Model)
-	local runtime = eggRuntimes[egg]
-	eggRuntimes[egg] = nil
-	if runtime and runtime.touchConnection then
-		runtime.touchConnection:Disconnect()
-		runtime.touchConnection = nil
-	end
-end
-
-local function removeEggFromActiveList(runtime: EggRuntime): number
-	if activeEggs[runtime.character] ~= runtime.eggs then
-		return 0
-	end
-
-	for index = #runtime.eggs, 1, -1 do
-		if runtime.eggs[index] == runtime.egg then
-			table.remove(runtime.eggs, index)
-			break
-		end
-	end
-	return #runtime.eggs
-end
-
-local function makeSurfaceCFrame(position: Vector3, normal: Vector3): CFrame
-	local right = normal.Unit
-	local reference = if math.abs(right:Dot(Vector3.yAxis)) < 0.98
-		then Vector3.yAxis
-		else Vector3.xAxis
-	local back = right:Cross(reference).Unit
-	local up = back:Cross(right).Unit
-	return CFrame.fromMatrix(position, right, up, back)
-end
-
-local function isValidBreakSurface(runtime: EggRuntime, otherPart: BasePart): boolean
-	if not otherPart.Parent
-		or not otherPart.CanCollide
-		or otherPart:IsDescendantOf(runtime.character)
-		or otherPart.CollisionGroup == EGG_GROUP
-		or otherPart.CollisionGroup == CHARACTER_GROUP
-		or otherPart.CollisionGroup == BASKET_COLLIDER_GROUP
-	then
-		return false
-	end
-
-	local otherModel = otherPart:FindFirstAncestorOfClass("Model")
-	return not otherModel or otherModel:GetAttribute("IsBasketEgg") ~= true
-end
-
-local function getImpactSurface(runtime: EggRuntime): (Vector3?, Vector3?, BasePart?)
-	local radius = math.max(
-		runtime.collider.Size.X,
-		runtime.collider.Size.Y,
-		runtime.collider.Size.Z
-	) * 0.5
-	local raycastParams = RaycastParams.new()
-	raycastParams.FilterType = Enum.RaycastFilterType.Exclude
-	raycastParams.FilterDescendantsInstances = { runtime.egg, runtime.character }
-	local result = Workspace:Raycast(
-		runtime.collider.Position,
-		-Vector3.yAxis * (radius + 0.15),
-		raycastParams
-	)
-	if result
-		and result.Normal.Y >= 0.25
-		and isValidBreakSurface(runtime, result.Instance)
-	then
-		return result.Position, result.Normal, result.Instance
-	end
-
-	return nil, nil, nil
-end
-
-local function createBrokenEggEffect(
-	position: Vector3,
-	normal: Vector3,
-	inheritedVelocity: Vector3
-)
-	local brokenEgg = Instance.new("Model")
-	brokenEgg.Name = "BrokenEgg"
-	brokenEgg.Parent = Workspace
-	local shellFragments = Instance.new("Folder")
-	shellFragments.Name = "ShellFragments"
-	shellFragments.Parent = brokenEgg
-
-	local surfaceCFrame = makeSurfaceCFrame(position, normal)
-	local planeX = surfaceCFrame.UpVector
-	local planeZ = surfaceCFrame.LookVector
-	local whiteBlobCount = breakRandom:NextInteger(
-		EGG_WHITE_BLOB_MIN,
-		EGG_WHITE_BLOB_MAX
-	)
-	local spreadTweenInfo = TweenInfo.new(
-		EGG_WHITE_SPREAD_TIME,
-		Enum.EasingStyle.Quart,
-		Enum.EasingDirection.Out
-	)
-
-	for index = 1, whiteBlobCount do
-		local isMainBlob = index == 1
-		local directionAngle = breakRandom:NextNumber(-math.pi, math.pi)
-		local spreadDistance = if isMainBlob
-			then 0
-			else breakRandom:NextNumber(0.16, 0.42)
-		local planarOffset = (
-			planeX * math.cos(directionAngle)
-			+ planeZ * math.sin(directionAngle)
-		) * spreadDistance
-		local targetWidth = if isMainBlob
-			then breakRandom:NextNumber(0.70, 0.98)
-			else breakRandom:NextNumber(0.34, 0.66)
-		local targetDepth = if isMainBlob
-			then breakRandom:NextNumber(0.58, 0.84)
-			else breakRandom:NextNumber(0.24, 0.52)
-		local targetThickness = breakRandom:NextNumber(0.022, 0.040)
-		local rotation = breakRandom:NextNumber(-math.pi, math.pi)
-		local targetPosition = position
-			+ normal * (targetThickness * 0.5 + 0.012)
-			+ planarOffset
-		local startPosition = position
-			+ normal * (targetThickness * 0.5 + 0.012)
-			+ planarOffset * 0.25
-
-		local white = Instance.new("Part")
-		white.Name = if isMainBlob
-			then "EggWhite"
-			else "EggWhiteFlow_" .. tostring(index - 1)
-		white.Shape = Enum.PartType.Cylinder
-		white.Size = Vector3.new(
-			targetThickness,
-			targetWidth * 0.48,
-			targetDepth * 0.48
-		)
-		white.CFrame = makeSurfaceCFrame(startPosition, normal)
-			* CFrame.Angles(rotation, 0, 0)
-		white.Color = Color3.fromRGB(242, 238, 215)
-		white.Material = Enum.Material.SmoothPlastic
-		white.Transparency = breakRandom:NextNumber(0.32, 0.48)
-		white.Anchored = true
-		white.CanCollide = false
-		white.CanTouch = false
-		white.CanQuery = false
-		white.Parent = brokenEgg
-
-		TweenService:Create(white, spreadTweenInfo, {
-			Size = Vector3.new(targetThickness, targetWidth, targetDepth),
-			CFrame = makeSurfaceCFrame(targetPosition, normal)
-				* CFrame.Angles(rotation, 0, 0),
-		}):Play()
-	end
-
-	local yolkAngle = breakRandom:NextNumber(-math.pi, math.pi)
-	local yolkOffsetDistance = breakRandom:NextNumber(0.06, 0.24)
-	local yolkOffset = (
-		planeX * math.cos(yolkAngle)
-		+ planeZ * math.sin(yolkAngle)
-	) * yolkOffsetDistance
-	local yolkDiameter = breakRandom:NextNumber(0.30, 0.42)
-	local yolkThickness = breakRandom:NextNumber(0.13, 0.19)
-	local yolkTargetPosition = position
-		+ normal * (yolkThickness * 0.5 + 0.025)
-		+ yolkOffset
-
-	local yolk = Instance.new("Part")
-	yolk.Name = "Yolk"
-	yolk.Shape = Enum.PartType.Ball
-	yolk.Size = Vector3.new(
-		yolkThickness,
-		yolkDiameter,
-		yolkDiameter * breakRandom:NextNumber(0.86, 1.08)
-	)
-	yolk.CFrame = makeSurfaceCFrame(
-		position + normal * (yolkThickness * 0.5 + 0.025) + yolkOffset * 0.35,
-		normal
-	)
-	yolk.Color = Color3.fromRGB(255, 164, 13)
-	yolk.Material = Enum.Material.SmoothPlastic
-	yolk.Transparency = 0.03
-	yolk.Anchored = true
-	yolk.CanCollide = false
-	yolk.CanTouch = false
-	yolk.CanQuery = false
-	yolk.Parent = brokenEgg
-
-	TweenService:Create(yolk, TweenInfo.new(
-		EGG_WHITE_SPREAD_TIME * 0.75,
-		Enum.EasingStyle.Quart,
-		Enum.EasingDirection.Out
-	), {
-		CFrame = makeSurfaceCFrame(yolkTargetPosition, normal),
-	}):Play()
-
-	for index = 1, SHELL_FRAGMENT_COUNT do
-		local fragment = Instance.new("WedgePart")
-		fragment.Name = "ShellFragment_" .. tostring(index)
-		fragment.Size = Vector3.new(
-			breakRandom:NextNumber(0.14, 0.26),
-			breakRandom:NextNumber(0.07, 0.14),
-			breakRandom:NextNumber(0.18, 0.32)
-		)
-		fragment.CFrame = CFrame.new(
-			position + normal * breakRandom:NextNumber(0.10, 0.18)
-		) * CFrame.fromOrientation(
-			breakRandom:NextNumber(-math.pi, math.pi),
-			breakRandom:NextNumber(-math.pi, math.pi),
-			breakRandom:NextNumber(-math.pi, math.pi)
-		)
-		fragment.Color = Color3.fromRGB(214, 187, 154)
-		fragment.Material = Enum.Material.SmoothPlastic
-		fragment.Anchored = false
-		fragment.CanCollide = true
-		fragment.CanTouch = false
-		fragment.CanQuery = false
-		fragment.CustomPhysicalProperties = PhysicalProperties.new(0.12, 0.45, 0.08, 20, 20)
-		fragment.Parent = shellFragments
-
-		local scatter = Vector3.new(
-			breakRandom:NextNumber(-4.5, 4.5),
-			breakRandom:NextNumber(2.5, 6.0),
-			breakRandom:NextNumber(-4.5, 4.5)
-		)
-		fragment.AssemblyLinearVelocity = inheritedVelocity * 0.2 + scatter
-		fragment.AssemblyAngularVelocity = Vector3.new(
-			breakRandom:NextNumber(-16, 16),
-			breakRandom:NextNumber(-16, 16),
-			breakRandom:NextNumber(-16, 16)
-		)
-	end
-
-	Debris:AddItem(shellFragments, SHELL_FRAGMENT_LIFETIME)
-end
-
-local function breakEgg(runtime: EggRuntime, touchedPart: BasePart)
-	if runtime.state ~= "Fallen"
-		or eggRuntimes[runtime.egg] ~= runtime
-		or not isValidBreakSurface(runtime, touchedPart)
-	then
-		return
-	end
-
-	if not runtime.hasDescended then
-		return
-	end
-	local currentVelocity = runtime.collider.AssemblyLinearVelocity
-
-	local impactPosition, impactNormal = getImpactSurface(runtime)
-	if not impactPosition or not impactNormal then
-		return
-	end
-
-	runtime.state = "Broken"
-	runtime.egg:SetAttribute("EggState", "Broken")
-	local remainingCount = removeEggFromActiveList(runtime)
-	removeEggRuntime(runtime.egg)
-	createBrokenEggEffect(impactPosition, impactNormal, currentVelocity)
-	if runtime.egg.Parent then
-		runtime.egg:Destroy()
-	end
-	if runtime.player.Parent == Players then
-		runtime.player:SetAttribute(REMAINING_EGG_COUNT_ATTRIBUTE, remainingCount)
-	end
-end
-
-local function registerEggRuntime(
-	player: Player,
-	character: Model,
-	basket: Model,
-	bottom: BasePart,
-	egg: Model,
-	collider: BasePart,
-	eggs: { Model }
-)
-	local runtime: EggRuntime = {
-		player = player,
-		character = character,
-		basket = basket,
-		bottom = bottom,
-		egg = egg,
-		collider = collider,
-		eggs = eggs,
-		state = "InBasket",
-		hasDescended = false,
-		touchConnection = nil,
-	}
-	eggRuntimes[egg] = runtime
-	egg:SetAttribute("EggState", "InBasket")
-	runtime.touchConnection = collider.Touched:Connect(function(otherPart: BasePart)
-		breakEgg(runtime, otherPart)
-	end)
-end
-
-local function isEggFullyOutsideBasket(runtime: EggRuntime): boolean
-	if not runtime.basket.Parent or not runtime.bottom.Parent then
-		return false
-	end
-
-	local localPosition = runtime.bottom.CFrame:PointToObjectSpace(runtime.collider.Position)
-	local radius = math.max(
-		runtime.collider.Size.X,
-		runtime.collider.Size.Y,
-		runtime.collider.Size.Z
-	) * 0.5
-	local floorLocalY = runtime.bottom.Size.Y * 0.5
-	local rimLocalY = floorLocalY + SHELL_USABLE_HEIGHT
-	if localPosition.Y - radius > rimLocalY
-		or localPosition.Y + radius < floorLocalY - 0.05
-	then
-		return true
-	end
-
-	local heightAlpha = math.clamp(
-		(localPosition.Y - floorLocalY) / SHELL_USABLE_HEIGHT,
-		0,
-		1
-	)
-	local interiorWidth = SHELL_LOWER_INTERIOR_WIDTH
-		+ (SHELL_UPPER_INTERIOR_WIDTH - SHELL_LOWER_INTERIOR_WIDTH) * heightAlpha
-	local interiorDepth = SHELL_LOWER_INTERIOR_DEPTH
-		+ (SHELL_UPPER_INTERIOR_DEPTH - SHELL_LOWER_INTERIOR_DEPTH) * heightAlpha
-	return math.abs(localPosition.X) - radius > interiorWidth * 0.5
-		or math.abs(localPosition.Z) - radius > interiorDepth * 0.5
-end
-
-local function markEggFallen(runtime: EggRuntime)
-	if runtime.state ~= "InBasket" then
-		return
-	end
-
-	runtime.state = "Fallen"
-	runtime.egg:SetAttribute("EggState", "Fallen")
-	runtime.hasDescended = runtime.collider.AssemblyLinearVelocity.Y <= 0
-	pcall(function()
-		runtime.collider:SetNetworkOwner(nil)
-	end)
-end
-
 local function cleanUpEggs(character: Model)
 	local eggs = activeEggs[character]
 	activeEggs[character] = nil
 	if eggs then
 		for _, egg in eggs do
-			removeEggRuntime(egg)
 			if egg.Parent then
 				egg:Destroy()
 			end
 		end
-	end
-
-	local player = Players:GetPlayerFromCharacter(character)
-	if player then
-		player:SetAttribute(REMAINING_EGG_COUNT_ATTRIBUTE, 0)
 	end
 end
 
@@ -796,11 +431,9 @@ local function cleanUpOwnedWorkspaceEggs(player: Player)
 			and child:GetAttribute("IsBasketEgg") == true
 			and child:GetAttribute("OwnerUserId") == player.UserId
 		then
-			removeEggRuntime(child)
 			child:Destroy()
 		end
 	end
-	player:SetAttribute(REMAINING_EGG_COUNT_ATTRIBUTE, 0)
 end
 
 local function invalidatePlayerSpawn(player: Player): number
@@ -951,7 +584,6 @@ local function spawnEggsInBasket(
 	end
 	local eggs: { Model } = {}
 	activeEggs[character] = eggs
-	player:SetAttribute(REMAINING_EGG_COUNT_ATTRIBUTE, 0)
 	local ownershipAssignedCount = 0
 	local forbiddenMovementRemovedCount = 0
 	local firstAssemblyPartCount: number? = nil
@@ -986,6 +618,8 @@ local function spawnEggsInBasket(
 		-- Workspace. From this point onward the basket and Roblox physics move it.
 		egg:PivotTo(bottom.CFrame * CFrame.new(localSpawnPosition))
 		egg.Parent = Workspace
+		collider.AssemblyLinearVelocity = bottom.AssemblyLinearVelocity
+		collider.AssemblyAngularVelocity = bottom.AssemblyAngularVelocity
 		table.insert(eggs, egg)
 		if forbiddenMovementRemoved then
 			forbiddenMovementRemovedCount += 1
@@ -1012,9 +646,6 @@ local function spawnEggsInBasket(
 				"reason=" .. tostring(ownershipReason or "unknown")
 			)
 		end
-
-		registerEggRuntime(player, character, basket, bottom, egg, collider, eggs)
-		player:SetAttribute(REMAINING_EGG_COUNT_ATTRIBUTE, #eggs)
 
 		if index < requestedCount then
 			task.wait(EGG_SPAWN_DELAY)
@@ -1113,7 +744,6 @@ end
 
 local function onPlayerAdded(player: Player)
 	getSelectedEggCount(player)
-	player:SetAttribute(REMAINING_EGG_COUNT_ATTRIBUTE, 0)
 	player.CharacterAdded:Connect(function(character: Model)
 		onCharacterAdded(player, character)
 	end)
@@ -1169,40 +799,11 @@ setEggCountRemote.OnServerEvent:Connect(function(player: Player, requestedValue:
 		return
 	end
 
-	if getSelectedEggCount(player) ~= requestedCount then
-		player:SetAttribute(SELECTED_EGG_COUNT_ATTRIBUTE, requestedCount)
+	if getSelectedEggCount(player) == requestedCount then
+		return
 	end
+	player:SetAttribute(SELECTED_EGG_COUNT_ATTRIBUTE, requestedCount)
 	requestEggRebuild(player)
-end)
-
-RunService.Heartbeat:Connect(function()
-	local staleEggs: { Model } = {}
-	for egg, runtime in eggRuntimes do
-		if not egg.Parent
-			or not runtime.collider.Parent
-			or activeEggs[runtime.character] ~= runtime.eggs
-		then
-			table.insert(staleEggs, egg)
-		elseif runtime.state == "InBasket" then
-			if isEggFullyOutsideBasket(runtime) then
-				markEggFallen(runtime)
-			end
-		elseif runtime.state == "Fallen" then
-			if runtime.collider.AssemblyLinearVelocity.Y < 0 then
-				runtime.hasDescended = true
-			end
-			if runtime.hasDescended then
-				local _, _, surfacePart = getImpactSurface(runtime)
-				if surfacePart then
-					breakEgg(runtime, surfacePart)
-				end
-			end
-		end
-	end
-
-	for _, egg in staleEggs do
-		removeEggRuntime(egg)
-	end
 end)
 
 Players.PlayerRemoving:Connect(function(player: Player)
