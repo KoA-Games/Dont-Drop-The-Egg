@@ -3,6 +3,7 @@
 local Players = game:GetService("Players")
 local PhysicsService = game:GetService("PhysicsService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
 local ServerStorage = game:GetService("ServerStorage")
 local StarterPlayer = game:GetService("StarterPlayer")
 local Workspace = game:GetService("Workspace")
@@ -11,12 +12,11 @@ local EGG_GROUP = "Eggs"
 local CHARACTER_GROUP = "Characters"
 local BASKET_COLLIDER_GROUP = "EggBasket"
 local BASKET_NAME = "Basket"
+local SOFT_MOUNT_READY_ATTRIBUTE = "SoftMountReady"
 local EGG_NAME = "BasketEgg"
 local COLLISION_SHELL_NAME = "EggCollisionShell"
 local EGG_COUNT = 5
 local EGG_SPAWN_DELAY = 0.1
-local VERTICAL_ATTACHMENT_NAME = "VerticalStabilizerAttachment"
-local VERTICAL_FORCE_NAME = "VerticalStabilizerForce"
 
 -- Raise/lower the egg here relative to Basket.Bottom.
 local EGG_BOTTOM_CLEARANCE = 0.05
@@ -46,6 +46,7 @@ local SHELL_WALL_Y_OFFSET = 0.085
 local SHELL_FLOOR_THICKNESS = 1.20
 
 local activeEggs: { [Model]: { Model } } = {}
+local LEGACY_VERTICAL_STABILIZER_NAME = "EggVerticalStabilizer"
 
 local FORBIDDEN_PHYSICS_CLASSES: { [string]: boolean } = {
 	AlignPosition = true,
@@ -78,6 +79,14 @@ local function removeHybridExperimentRemnants()
 		StarterPlayer.StarterPlayerScripts:FindFirstChild("HybridEggController")
 	if staleStarterController then
 		staleStarterController:Destroy()
+	end
+end
+
+local function removeLegacyEggVerticalStabilizer(container: Instance)
+	local legacyScript = container:FindFirstChild(LEGACY_VERTICAL_STABILIZER_NAME)
+	if legacyScript then
+		legacyScript:Destroy()
+		print("[EggPhysics] Removed legacy per-egg vertical stabilizer")
 	end
 end
 
@@ -274,31 +283,6 @@ local function configureCleanEggAssembly(egg: Model): (Part?, boolean)
 	return collider, forbiddenMovementRemoved
 end
 
-local function addVerticalStabilizerForce(collider: Part)
-	local oldAttachment = collider:FindFirstChild(VERTICAL_ATTACHMENT_NAME)
-	if oldAttachment then
-		oldAttachment:Destroy()
-	end
-	local oldForce = collider:FindFirstChild(VERTICAL_FORCE_NAME)
-	if oldForce then
-		oldForce:Destroy()
-	end
-
-	local attachment = Instance.new("Attachment")
-	attachment.Name = VERTICAL_ATTACHMENT_NAME
-	attachment.Position = Vector3.zero
-	attachment.Parent = collider
-
-	local verticalForce = Instance.new("VectorForce")
-	verticalForce.Name = VERTICAL_FORCE_NAME
-	verticalForce.Attachment0 = attachment
-	verticalForce.RelativeTo = Enum.ActuatorRelativeTo.World
-	verticalForce.ApplyAtCenterOfMass = true
-	verticalForce.Force = Vector3.zero
-	verticalForce.Enabled = false
-	verticalForce.Parent = collider
-end
-
 local function getAssemblyPartCount(collider: BasePart): number
 	local connected: { [BasePart]: boolean } = { [collider] = true }
 	for _, part in collider:GetConnectedParts(true) do
@@ -324,6 +308,20 @@ local function spawnEggsInBasket(character: Model)
 	local bottom = basket:FindFirstChild("Bottom")
 	if not bottom or not bottom:IsA("BasePart") then
 		warn("EggBasketSpawnService: Basket.Bottom was not available")
+		return
+	end
+
+	-- Do not add a collision shell or loose eggs until the basket has become its
+	-- own player-owned assembly and both soft constraints are configured.
+	local readyDeadline = os.clock() + 3
+	while basket:GetAttribute(SOFT_MOUNT_READY_ATTRIBUTE) ~= true
+		and basket.Parent
+		and os.clock() < readyDeadline
+	do
+		RunService.Heartbeat:Wait()
+	end
+	if basket:GetAttribute(SOFT_MOUNT_READY_ATTRIBUTE) ~= true then
+		warn("EggBasketSpawnService: soft basket mount was not ready")
 		return
 	end
 
@@ -375,8 +373,6 @@ local function spawnEggsInBasket(character: Model)
 			warn("EggBasketSpawnService: clean Collider/Visual assembly was not available")
 			return
 		end
-		addVerticalStabilizerForce(collider)
-
 		local spawnHeight = bottom.Size.Y * 0.5 + collider.Size.Y * 0.5 + EGG_BOTTOM_CLEARANCE
 		-- This is the egg's only scripted movement, performed before it enters
 		-- Workspace. From this point onward the basket and Roblox physics move it.
@@ -415,6 +411,75 @@ local function spawnEggsInBasket(character: Model)
 	end
 
 	print("[EggPhysics] ActiveEggCount", #eggs)
+	if RunService:IsStudio() and humanoid then
+		local jumpObserved = false
+		local retentionConnection: RBXScriptConnection
+		retentionConnection = humanoid.StateChanged:Connect(function(
+			_previousState: Enum.HumanoidStateType,
+			newState: Enum.HumanoidStateType
+		)
+			if newState == Enum.HumanoidStateType.Jumping then
+				jumpObserved = true
+			elseif jumpObserved and newState == Enum.HumanoidStateType.Landed then
+				jumpObserved = false
+				task.delay(0.35, function()
+					if activeEggs[character] ~= eggs or not bottom.Parent then
+						return
+					end
+
+					local insideCount = 0
+					for _, egg in eggs do
+						local collider = egg:FindFirstChild("Collider")
+						if collider and collider:IsA("BasePart") and collider.Parent then
+							local localPosition = bottom.CFrame:PointToObjectSpace(collider.Position)
+							if math.abs(localPosition.X) <= bottom.Size.X * 0.5
+								and math.abs(localPosition.Z) <= bottom.Size.Z * 0.5
+								and localPosition.Y >= 0
+								and localPosition.Y <= 0.9
+							then
+								insideCount += 1
+							end
+						end
+					end
+					print(
+						"[EggPhysics] PostJumpRetention",
+						"inside=" .. tostring(insideCount),
+						"total=" .. tostring(#eggs)
+					)
+				end)
+			end
+		end)
+		character.Destroying:Once(function()
+			retentionConnection:Disconnect()
+		end)
+	end
+	task.delay(2, function()
+		if activeEggs[character] ~= eggs or not bottom.Parent then
+			return
+		end
+
+		local rimLocalY = bottom.Size.Y * 0.5 + 0.65
+		local highestEggTop = -math.huge
+		for _, egg in eggs do
+			local collider = egg:FindFirstChild("Collider")
+			if collider and collider:IsA("BasePart") and collider.Parent then
+				local localCenter = bottom.CFrame:PointToObjectSpace(collider.Position)
+				highestEggTop = math.max(
+					highestEggTop,
+					localCenter.Y + collider.Size.Y * 0.5
+				)
+			end
+		end
+
+		if highestEggTop > -math.huge then
+			print(
+				"[EggPhysics] Capacity",
+				"interiorHeight=0.650",
+				"colliderDiameter=" .. string.format("%.3f", EGG_COLLIDER_DIAMETER),
+				"highestClearance=" .. string.format("%.3f", rimLocalY - highestEggTop)
+			)
+		end
+	end)
 	task.delay(1, function()
 		if bottom.Parent then
 			local upDot = math.clamp(bottom.CFrame.UpVector:Dot(Vector3.yAxis), -1, 1)
@@ -432,6 +497,7 @@ local function spawnEggsInBasket(character: Model)
 end
 
 local function onCharacterAdded(character: Model)
+	removeLegacyEggVerticalStabilizer(character)
 	applyCharacterCollisionGroup(character)
 	task.spawn(spawnEggsInBasket, character)
 end
@@ -447,11 +513,12 @@ end
 
 configureCollisionGroups()
 removeHybridExperimentRemnants()
+removeLegacyEggVerticalStabilizer(StarterPlayer.StarterCharacterScripts)
 removeStaleRuntimeEggs()
 print(
-	"[EggPhysics] NativeVerticalStabilizer",
+	"[EggPhysics] NativeFiveEggs",
 	"eggCount=" .. tostring(EGG_COUNT),
-	"forcesPrepared=true"
+	"perEggForces=false"
 )
 Players.PlayerAdded:Connect(onPlayerAdded)
 

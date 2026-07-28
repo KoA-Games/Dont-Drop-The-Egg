@@ -32,8 +32,20 @@ end
 
 local BASKET_NAME = "Basket"
 local LEGACY_BASKET_NAME = "TemporaryBasket"
+local BASKET_TARGET_NAME = "BasketTarget"
+local BASKET_ATTACHMENT_NAME = "BasketAttachment"
+local BASKET_POSITION_ALIGN_NAME = "BasketAlignPosition"
+local BASKET_ORIENTATION_ALIGN_NAME = "BasketAlignOrientation"
+local SOFT_MOUNT_READY_ATTRIBUTE = "SoftMountReady"
 local BASKET_COLOR = Color3.fromRGB(151, 105, 54)
 local BASKET_MATERIAL = Enum.Material.Wood
+
+-- Soft physical suspension. Tune only these values when refining lag.
+local POSITION_RESPONSIVENESS = 200
+local POSITION_MAX_VELOCITY = 80
+local POSITION_MAX_FORCE_PER_MASS = 2500
+local ORIENTATION_RESPONSIVENESS = 20
+local ORIENTATION_MAX_TORQUE_PER_MASS = 3000
 
 local RIGHT_IK_NAME = "BasketRightArmIK"
 local LEFT_IK_NAME = "BasketLeftArmIK"
@@ -115,6 +127,13 @@ local function configureBasketPart(part: Part)
 	part.CanTouch = false
 	part.CanQuery = false
 	part.Massless = true
+end
+
+local function removeOldBasketTarget(root: BasePart)
+	local existing = root:FindFirstChild(BASKET_TARGET_NAME)
+	if existing then
+		existing:Destroy()
+	end
 end
 
 local function createBasketPart(
@@ -404,6 +423,7 @@ local function attachBasket(character: Model)
 
 	local head = character:WaitForChild("Head", 10)
 	local humanoid = character:WaitForChild("Humanoid", 10)
+	local root = character:WaitForChild("HumanoidRootPart", 10)
 	if not head or not head:IsA("BasePart") then
 		warn("BasketAttachmentService: character Head was not available")
 		return
@@ -412,9 +432,16 @@ local function attachBasket(character: Model)
 		warn("BasketAttachmentService: character Humanoid was not available")
 		return
 	end
+	if not root or not root:IsA("BasePart") then
+		warn("BasketAttachmentService: HumanoidRootPart was not available")
+		return
+	end
+
+	removeOldBasketTarget(root)
 
 	local basket = Instance.new("Model")
 	basket.Name = BASKET_NAME
+	basket:SetAttribute(SOFT_MOUNT_READY_ATTRIBUTE, false)
 
 	local basketPivot = head.CFrame * BASKET_OFFSET
 	local bottom: Part? = nil
@@ -433,15 +460,87 @@ local function attachBasket(character: Model)
 	end
 
 	basket.PrimaryPart = bottom
+	-- The basket is now its own physical assembly. Only the floor carries mass;
+	-- walls and the later invisible collision shell stay massless so the center
+	-- of mass remains low and stable.
+	bottom.Massless = false
+	bottom.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.55, 0, 100, 100)
 
 	for _, child in basket:GetChildren() do
 		if child:IsA("BasePart") and child ~= bottom then
 			weldParts(bottom, child, "BottomWeld")
 		end
 	end
-	weldParts(head, bottom, "HeadWeld")
+
+	local basketTarget = Instance.new("Attachment")
+	basketTarget.Name = BASKET_TARGET_NAME
+	basketTarget.CFrame = root.CFrame:ToObjectSpace(bottom.CFrame)
+	basketTarget.Parent = root
+
+	local basketAttachment = Instance.new("Attachment")
+	basketAttachment.Name = BASKET_ATTACHMENT_NAME
+	basketAttachment.CFrame = CFrame.identity
+	basketAttachment.Parent = bottom
+
+	local basketMass = bottom.AssemblyMass
+	local positionMaxForce = math.max(10000, basketMass * POSITION_MAX_FORCE_PER_MASS)
+	local orientationMaxTorque = math.max(
+		10000,
+		basketMass * ORIENTATION_MAX_TORQUE_PER_MASS
+	)
+
+	local alignPosition = Instance.new("AlignPosition")
+	alignPosition.Name = BASKET_POSITION_ALIGN_NAME
+	alignPosition.Mode = Enum.PositionAlignmentMode.TwoAttachment
+	alignPosition.Attachment0 = basketAttachment
+	alignPosition.Attachment1 = basketTarget
+	alignPosition.RigidityEnabled = false
+	alignPosition.ReactionForceEnabled = false
+	alignPosition.ApplyAtCenterOfMass = true
+	alignPosition.ForceLimitMode = Enum.ForceLimitMode.Magnitude
+	alignPosition.Responsiveness = POSITION_RESPONSIVENESS
+	alignPosition.MaxVelocity = POSITION_MAX_VELOCITY
+	alignPosition.MaxForce = positionMaxForce
+	alignPosition.Parent = bottom
+
+	local alignOrientation = Instance.new("AlignOrientation")
+	alignOrientation.Name = BASKET_ORIENTATION_ALIGN_NAME
+	alignOrientation.Mode = Enum.OrientationAlignmentMode.TwoAttachment
+	alignOrientation.Attachment0 = basketAttachment
+	alignOrientation.Attachment1 = basketTarget
+	alignOrientation.RigidityEnabled = false
+	alignOrientation.ReactionTorqueEnabled = false
+	alignOrientation.Responsiveness = ORIENTATION_RESPONSIVENESS
+	alignOrientation.MaxTorque = orientationMaxTorque
+	alignOrientation.Parent = bottom
 
 	basket.Parent = character
+
+	local basketOwner = Players:GetPlayerFromCharacter(character)
+	local canSetOwner, ownerReason = bottom:CanSetNetworkOwnership()
+	local ownerAssigned = false
+	if canSetOwner and basketOwner then
+		local assigned, assignmentError = pcall(function()
+			bottom:SetNetworkOwner(basketOwner)
+		end)
+		ownerAssigned = assigned
+		if not assigned then
+			ownerReason = tostring(assignmentError)
+		end
+	end
+	basket:SetAttribute(SOFT_MOUNT_READY_ATTRIBUTE, true)
+
+	local actualOwner = bottom:GetNetworkOwner()
+	print(
+		"[BasketPhysics] SoftMount",
+		"mass=" .. string.format("%.4f", bottom.AssemblyMass),
+		"maxForce=" .. string.format("%.1f", positionMaxForce),
+		"maxTorque=" .. string.format("%.1f", orientationMaxTorque),
+		"owner=" .. (actualOwner and actualOwner.Name or "server"),
+		"assigned=" .. tostring(ownerAssigned),
+		"reason=" .. tostring(ownerReason or "none"),
+		"separateAssembly=true"
+	)
 
 	-- Always clear controls left by an earlier version/hot reload. During this
 	-- test createArmIK is unreachable, so the avatar keeps its default arms.
@@ -454,6 +553,14 @@ local function attachBasket(character: Model)
 	end
 
 	playBasketHoldAnimation(character, humanoid, basket)
+
+	local function cleanUpTarget()
+		if basketTarget.Parent then
+			basketTarget:Destroy()
+		end
+	end
+	basket.Destroying:Once(cleanUpTarget)
+	character.Destroying:Once(cleanUpTarget)
 end
 
 local function onPlayerAdded(player: Player)
