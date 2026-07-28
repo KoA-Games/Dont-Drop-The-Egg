@@ -7,6 +7,7 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local ServerStorage = game:GetService("ServerStorage")
 local StarterPlayer = game:GetService("StarterPlayer")
+local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 
 local EGG_GROUP = "Eggs"
@@ -25,8 +26,11 @@ local DEFAULT_EGG_COUNT = 5
 local MAX_EGG_COUNT = 30
 local EGG_SPAWN_DELAY = 0.06
 local EGG_REBUILD_DELAY = 0.08
-local BROKEN_EGG_LIFETIME = 15
-local SHELL_FRAGMENT_COUNT = 6
+local SHELL_FRAGMENT_LIFETIME = 15
+local SHELL_FRAGMENT_COUNT = 12
+local EGG_WHITE_BLOB_MIN = 4
+local EGG_WHITE_BLOB_MAX = 6
+local EGG_WHITE_SPREAD_TIME = 1.6
 
 -- Raise/lower the egg here relative to Basket.Bottom.
 local EGG_BOTTOM_CLEARANCE = 0.015
@@ -517,41 +521,120 @@ local function createBrokenEggEffect(
 	shellFragments.Name = "ShellFragments"
 	shellFragments.Parent = brokenEgg
 
-	local white = Instance.new("Part")
-	white.Name = "EggWhite"
-	white.Shape = Enum.PartType.Cylinder
-	white.Size = Vector3.new(0.035, 0.82, 0.68)
-	white.CFrame = makeSurfaceCFrame(position + normal * 0.018, normal)
-	white.Color = Color3.fromRGB(245, 242, 218)
-	white.Material = Enum.Material.SmoothPlastic
-	white.Transparency = 0.38
-	white.Anchored = true
-	white.CanCollide = false
-	white.CanTouch = false
-	white.CanQuery = false
-	white.Parent = brokenEgg
+	local surfaceCFrame = makeSurfaceCFrame(position, normal)
+	local planeX = surfaceCFrame.UpVector
+	local planeZ = surfaceCFrame.LookVector
+	local whiteBlobCount = breakRandom:NextInteger(
+		EGG_WHITE_BLOB_MIN,
+		EGG_WHITE_BLOB_MAX
+	)
+	local spreadTweenInfo = TweenInfo.new(
+		EGG_WHITE_SPREAD_TIME,
+		Enum.EasingStyle.Quart,
+		Enum.EasingDirection.Out
+	)
+
+	for index = 1, whiteBlobCount do
+		local isMainBlob = index == 1
+		local directionAngle = breakRandom:NextNumber(-math.pi, math.pi)
+		local spreadDistance = if isMainBlob
+			then 0
+			else breakRandom:NextNumber(0.16, 0.42)
+		local planarOffset = (
+			planeX * math.cos(directionAngle)
+			+ planeZ * math.sin(directionAngle)
+		) * spreadDistance
+		local targetWidth = if isMainBlob
+			then breakRandom:NextNumber(0.70, 0.98)
+			else breakRandom:NextNumber(0.34, 0.66)
+		local targetDepth = if isMainBlob
+			then breakRandom:NextNumber(0.58, 0.84)
+			else breakRandom:NextNumber(0.24, 0.52)
+		local targetThickness = breakRandom:NextNumber(0.022, 0.040)
+		local rotation = breakRandom:NextNumber(-math.pi, math.pi)
+		local targetPosition = position
+			+ normal * (targetThickness * 0.5 + 0.012)
+			+ planarOffset
+		local startPosition = position
+			+ normal * (targetThickness * 0.5 + 0.012)
+			+ planarOffset * 0.25
+
+		local white = Instance.new("Part")
+		white.Name = if isMainBlob
+			then "EggWhite"
+			else "EggWhiteFlow_" .. tostring(index - 1)
+		white.Shape = Enum.PartType.Cylinder
+		white.Size = Vector3.new(
+			targetThickness,
+			targetWidth * 0.48,
+			targetDepth * 0.48
+		)
+		white.CFrame = makeSurfaceCFrame(startPosition, normal)
+			* CFrame.Angles(rotation, 0, 0)
+		white.Color = Color3.fromRGB(242, 238, 215)
+		white.Material = Enum.Material.SmoothPlastic
+		white.Transparency = breakRandom:NextNumber(0.32, 0.48)
+		white.Anchored = true
+		white.CanCollide = false
+		white.CanTouch = false
+		white.CanQuery = false
+		white.Parent = brokenEgg
+
+		TweenService:Create(white, spreadTweenInfo, {
+			Size = Vector3.new(targetThickness, targetWidth, targetDepth),
+			CFrame = makeSurfaceCFrame(targetPosition, normal)
+				* CFrame.Angles(rotation, 0, 0),
+		}):Play()
+	end
+
+	local yolkAngle = breakRandom:NextNumber(-math.pi, math.pi)
+	local yolkOffsetDistance = breakRandom:NextNumber(0.06, 0.24)
+	local yolkOffset = (
+		planeX * math.cos(yolkAngle)
+		+ planeZ * math.sin(yolkAngle)
+	) * yolkOffsetDistance
+	local yolkDiameter = breakRandom:NextNumber(0.30, 0.42)
+	local yolkThickness = breakRandom:NextNumber(0.13, 0.19)
+	local yolkTargetPosition = position
+		+ normal * (yolkThickness * 0.5 + 0.025)
+		+ yolkOffset
 
 	local yolk = Instance.new("Part")
 	yolk.Name = "Yolk"
-	yolk.Shape = Enum.PartType.Cylinder
-	yolk.Size = Vector3.new(0.065, 0.36, 0.36)
-	yolk.CFrame = makeSurfaceCFrame(position + normal * 0.055, normal)
-	yolk.Color = Color3.fromRGB(255, 174, 18)
+	yolk.Shape = Enum.PartType.Ball
+	yolk.Size = Vector3.new(
+		yolkThickness,
+		yolkDiameter,
+		yolkDiameter * breakRandom:NextNumber(0.86, 1.08)
+	)
+	yolk.CFrame = makeSurfaceCFrame(
+		position + normal * (yolkThickness * 0.5 + 0.025) + yolkOffset * 0.35,
+		normal
+	)
+	yolk.Color = Color3.fromRGB(255, 164, 13)
 	yolk.Material = Enum.Material.SmoothPlastic
-	yolk.Transparency = 0.04
+	yolk.Transparency = 0.03
 	yolk.Anchored = true
 	yolk.CanCollide = false
 	yolk.CanTouch = false
 	yolk.CanQuery = false
 	yolk.Parent = brokenEgg
 
+	TweenService:Create(yolk, TweenInfo.new(
+		EGG_WHITE_SPREAD_TIME * 0.75,
+		Enum.EasingStyle.Quart,
+		Enum.EasingDirection.Out
+	), {
+		CFrame = makeSurfaceCFrame(yolkTargetPosition, normal),
+	}):Play()
+
 	for index = 1, SHELL_FRAGMENT_COUNT do
 		local fragment = Instance.new("WedgePart")
 		fragment.Name = "ShellFragment_" .. tostring(index)
 		fragment.Size = Vector3.new(
-			breakRandom:NextNumber(0.10, 0.18),
-			breakRandom:NextNumber(0.05, 0.10),
-			breakRandom:NextNumber(0.12, 0.22)
+			breakRandom:NextNumber(0.14, 0.26),
+			breakRandom:NextNumber(0.07, 0.14),
+			breakRandom:NextNumber(0.18, 0.32)
 		)
 		fragment.CFrame = CFrame.new(
 			position + normal * breakRandom:NextNumber(0.10, 0.18)
@@ -582,7 +665,7 @@ local function createBrokenEggEffect(
 		)
 	end
 
-	Debris:AddItem(shellFragments, BROKEN_EGG_LIFETIME)
+	Debris:AddItem(shellFragments, SHELL_FRAGMENT_LIFETIME)
 end
 
 local function breakEgg(runtime: EggRuntime, touchedPart: BasePart)
