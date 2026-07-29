@@ -11,11 +11,11 @@ local SPREAD_SETTLE_DURATION = 0.08
 local YOLK_DELAY = 0.035
 local SHELL_SPREAD_DURATION = 0.22
 local FADE_DURATION = 0.3
-local SURFACE_OFFSET = 0.012
+local SURFACE_OFFSET = 0.018
 
-local WHITE_COLOR = Color3.fromRGB(255, 248, 221)
-local YOLK_COLOR = Color3.fromRGB(245, 158, 35)
-local SHELL_COLOR = Color3.fromRGB(255, 241, 205)
+local WHITE_COLOR = Color3.fromRGB(255, 246, 214)
+local YOLK_COLOR = Color3.fromRGB(255, 170, 24)
+local SHELL_COLOR = Color3.fromRGB(255, 237, 196)
 
 local random = Random.new()
 
@@ -37,59 +37,59 @@ type ShellDefinition = {
 local WHITE_DEFINITIONS: { WhiteDefinition } = {
 	{
 		name = "WhiteCenter",
-		size = Vector3.new(1.55, 0.040, 1.05),
-		position = Vector3.new(0, 0.020, 0),
+		size = Vector3.new(1.65, 0.050, 1.10),
+		position = Vector3.new(0, 0.025, 0),
 		rotationDegrees = -7,
-		transparency = 0.16,
+		transparency = 0.12,
 	},
 	{
 		name = "WhiteLobe_01",
-		size = Vector3.new(1.05, 0.034, 0.75),
-		position = Vector3.new(0.63, 0.017, 0.05),
+		size = Vector3.new(1.15, 0.050, 0.82),
+		position = Vector3.new(0.62, 0.025, 0.06),
 		rotationDegrees = 17,
-		transparency = 0.18,
+		transparency = 0.14,
 	},
 	{
 		name = "WhiteLobe_02",
-		size = Vector3.new(0.95, 0.030, 0.70),
-		position = Vector3.new(-0.60, 0.015, -0.10),
+		size = Vector3.new(1.08, 0.050, 0.78),
+		position = Vector3.new(-0.61, 0.025, -0.14),
 		rotationDegrees = -24,
-		transparency = 0.20,
+		transparency = 0.16,
 	},
 	{
 		name = "WhiteLobe_03",
-		size = Vector3.new(1.05, 0.032, 0.67),
-		position = Vector3.new(0.12, 0.016, 0.51),
+		size = Vector3.new(1.20, 0.050, 0.75),
+		position = Vector3.new(0.12, 0.025, 0.50),
 		rotationDegrees = 8,
-		transparency = 0.19,
+		transparency = 0.15,
 	},
 	{
 		name = "WhiteLobe_04",
-		size = Vector3.new(0.90, 0.028, 0.72),
-		position = Vector3.new(-0.20, 0.014, -0.50),
+		size = Vector3.new(0.98, 0.050, 0.82),
+		position = Vector3.new(-0.26, 0.025, -0.52),
 		rotationDegrees = 31,
-		transparency = 0.21,
+		transparency = 0.17,
 	},
 }
 
 local SHELL_DEFINITIONS: { ShellDefinition } = {
 	{
 		name = "Shell_01",
-		size = Vector3.new(0.30, 0.08, 0.23),
-		position = Vector3.new(0.78, 0.075, 0.26),
-		rotation = Vector3.new(-12, 38, 9),
+		size = Vector3.new(0.22, 0.05, 0.18),
+		position = Vector3.new(0.69, 0.055, 0.24),
+		rotation = Vector3.new(-8, 38, 7),
 	},
 	{
 		name = "Shell_02",
-		size = Vector3.new(0.22, 0.06, 0.18),
-		position = Vector3.new(-0.91, 0.060, 0.14),
-		rotation = Vector3.new(8, -54, -6),
+		size = Vector3.new(0.18, 0.05, 0.15),
+		position = Vector3.new(-0.73, 0.052, 0.12),
+		rotation = Vector3.new(6, -54, -5),
 	},
 	{
 		name = "Shell_03",
-		size = Vector3.new(0.28, 0.07, 0.17),
-		position = Vector3.new(0.31, 0.065, -0.73),
-		rotation = Vector3.new(-7, 112, 13),
+		size = Vector3.new(0.21, 0.05, 0.14),
+		position = Vector3.new(0.24, 0.054, -0.63),
+		rotation = Vector3.new(-5, 112, 9),
 	},
 }
 
@@ -162,11 +162,14 @@ local function createWhiteParts(
 		local finalPosition = scaledPosition(definition.position, visualScale)
 		local rotation = CFrame.Angles(0, math.rad(definition.rotationDegrees), 0)
 		local finalCFrame = surfaceFrame * CFrame.new(finalPosition) * rotation
-		local startSize = finalSize * 0.25
+		-- Roblox clamps BasePart axes below 0.05 studs. Keep the white at its
+		-- final thickness throughout the tween so it never starts inside the
+		-- contacted surface and disappears.
+		local startSize = Vector3.new(finalSize.X * 0.28, finalSize.Y, finalSize.Z * 0.28)
 		local startPosition = Vector3.new(
-			finalPosition.X * 0.25,
-			startSize.Y * 0.5,
-			finalPosition.Z * 0.25
+			finalPosition.X * 0.28,
+			finalPosition.Y,
+			finalPosition.Z * 0.28
 		)
 		local expandedPosition = Vector3.new(
 			finalPosition.X * 1.10,
@@ -180,7 +183,8 @@ local function createWhiteParts(
 		part.Size = startSize
 		part.CFrame = surfaceFrame * CFrame.new(startPosition) * rotation
 		part.Color = WHITE_COLOR
-		part.Transparency = math.min(definition.transparency + 0.16, 0.38)
+		part.Transparency = math.min(definition.transparency + 0.10, 0.30)
+		part.Reflectance = 0.015
 		configureVisiblePart(part)
 		part.Parent = parent
 
@@ -233,13 +237,13 @@ local function createWhiteParts(
 end
 
 local function createYolk(parent: Model, surfaceFrame: CFrame, visualScale: number): BasePart
-	local finalSize = Vector3.new(0.59, 0.18, 0.56) * visualScale
-	local finalPosition = Vector3.new(0.17, 0.13, -0.08) * visualScale
-	local startSize = finalSize * 0.25
+	local finalSize = Vector3.new(0.64, 0.14, 0.58) * visualScale
+	local finalPosition = Vector3.new(0.17, 0.12, -0.08) * visualScale
+	local startSize = Vector3.new(finalSize.X * 0.28, 0.08 * visualScale, finalSize.Z * 0.28)
 	local startPosition = Vector3.new(
-		finalPosition.X * 0.35,
-		0.04 * visualScale + startSize.Y * 0.5,
-		finalPosition.Z * 0.35
+		finalPosition.X * 0.30,
+		0.05 * visualScale + startSize.Y * 0.5,
+		finalPosition.Z * 0.30
 	)
 
 	local yolk = Instance.new("Part")
@@ -250,6 +254,7 @@ local function createYolk(parent: Model, surfaceFrame: CFrame, visualScale: numb
 	yolk.Color = YOLK_COLOR
 	yolk.Transparency = 1
 	configureVisiblePart(yolk)
+	yolk.Reflectance = 0.045
 	yolk.Parent = parent
 
 	task.delay(YOLK_DELAY, function()
@@ -258,7 +263,7 @@ local function createYolk(parent: Model, surfaceFrame: CFrame, visualScale: numb
 		end
 		TweenService:Create(
 			yolk,
-			TweenInfo.new(0.17, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+			TweenInfo.new(0.17, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
 			{
 				Size = finalSize,
 				CFrame = surfaceFrame * CFrame.new(finalPosition),
@@ -290,7 +295,7 @@ local function createShellPieces(
 
 		local shell = Instance.new("WedgePart")
 		shell.Name = definition.name
-		shell.Size = finalSize * 0.65
+		shell.Size = Vector3.new(finalSize.X * 0.72, finalSize.Y, finalSize.Z * 0.72)
 		shell.CFrame = surfaceFrame * CFrame.new(startPosition) * startRotation
 		shell.Color = SHELL_COLOR
 		shell.Transparency = 0.16
@@ -389,6 +394,10 @@ function BrokenEggService.SpawnBrokenEgg(
 	shellPieces.Name = "ShellPieces"
 	shellPieces.Parent = brokenEgg
 
+	-- Tween only after the hierarchy is in Workspace. This guarantees that the
+	-- first visible frame and every subsequent size update are rendered.
+	brokenEgg.Parent = getBrokenEggFolder()
+
 	local visibleParts = createWhiteParts(eggWhite, surfaceFrame, visualScale)
 	local yolk = createYolk(brokenEgg, surfaceFrame, visualScale)
 	table.insert(visibleParts, yolk)
@@ -397,7 +406,6 @@ function BrokenEggService.SpawnBrokenEgg(
 	end
 	local hitbox = createSlipHitbox(brokenEgg, surfaceFrame, visualScale)
 
-	brokenEgg.Parent = getBrokenEggFolder()
 	scheduleCleanup(brokenEgg, visibleParts, hitbox)
 	return brokenEgg
 end

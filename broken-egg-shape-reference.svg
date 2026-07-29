@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="floor" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#788294"/>
+      <stop offset="1" stop-color="#5d6676"/>
+    </linearGradient>
+    <radialGradient id="yolk" cx="38%" cy="30%" r="72%">
+      <stop offset="0" stop-color="#ffd44c"/>
+      <stop offset="0.50" stop-color="#ffad1f"/>
+      <stop offset="1" stop-color="#e8810b"/>
+    </radialGradient>
+    <linearGradient id="shellTop" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff9e8"/>
+      <stop offset="1" stop-color="#efd9ac"/>
+    </linearGradient>
+    <linearGradient id="shellInside" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d9b97d"/>
+      <stop offset="1" stop-color="#b98d4f"/>
+    </linearGradient>
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="10"/>
+      <feOffset dy="12"/>
+      <feColorMatrix values="0 0 0 0 0.12 0 0 0 0 0.15 0 0 0 0 0.19 0 0 0 0.34 0"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="yolkShadow" x="-35%" y="-35%" width="170%" height="180%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="8"/>
+      <feOffset dy="11"/>
+      <feColorMatrix values="0 0 0 0 0.35 0 0 0 0 0.19 0 0 0 0 0.02 0 0 0 0.42 0"/>
+      <feMerge>
+        <feMergeNode/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Neutral Roblox-like floor for scale and contrast. -->
+  <rect width="1024" height="1024" fill="url(#floor)"/>
+  <g stroke="#4f5868" stroke-width="5" opacity="0.42">
+    <path d="M0 128H1024 M0 384H1024 M0 640H1024 M0 896H1024"/>
+    <path d="M128 0V1024 M384 0V1024 M640 0V1024 M896 0V1024"/>
+  </g>
+
+  <!-- Five overlapping flattened lobes: one center and four asymmetric edges. -->
+  <g filter="url(#softShadow)">
+    <ellipse cx="514" cy="536" rx="296" ry="190"
+      transform="rotate(-7 514 536)" fill="#fff4d5" fill-opacity="0.91"/>
+    <ellipse cx="677" cy="521" rx="201" ry="130"
+      transform="rotate(17 677 521)" fill="#fff7de" fill-opacity="0.89"/>
+    <ellipse cx="352" cy="572" rx="187" ry="126"
+      transform="rotate(-24 352 572)" fill="#fff1cf" fill-opacity="0.87"/>
+    <ellipse cx="548" cy="674" rx="205" ry="119"
+      transform="rotate(8 548 674)" fill="#fff6dc" fill-opacity="0.88"/>
+    <ellipse cx="445" cy="377" rx="168" ry="131"
+      transform="rotate(31 445 377)" fill="#ffefca" fill-opacity="0.85"/>
+  </g>
+
+  <!-- Subtle wet highlights keep the white raw and translucent rather than cooked. -->
+  <g fill="none" stroke="#fffdf4" stroke-linecap="round" opacity="0.58">
+    <path d="M296 485 C358 404 445 373 526 384" stroke-width="18"/>
+    <path d="M632 611 C702 589 744 548 758 503" stroke-width="12"/>
+  </g>
+
+  <!-- One low, off-center orange-yellow yolk. -->
+  <ellipse cx="558" cy="520" rx="91" ry="70" fill="url(#yolk)" filter="url(#yolkShadow)"/>
+  <ellipse cx="530" cy="492" rx="31" ry="18" fill="#fff2a4" fill-opacity="0.52"/>
+
+  <!-- Three small wedge-like shell fragments, partly on and partly outside the white. -->
+  <g filter="url(#softShadow)">
+    <g transform="translate(745 425) rotate(28)">
+      <polygon points="-34,24 0,-31 38,25" fill="url(#shellInside)"/>
+      <polygon points="-28,17 0,-25 31,19 3,7" fill="url(#shellTop)"/>
+    </g>
+    <g transform="translate(274 596) rotate(-52)">
+      <polygon points="-29,20 2,-25 31,21" fill="url(#shellInside)"/>
+      <polygon points="-23,14 2,-19 24,15 0,5" fill="url(#shellTop)"/>
+    </g>
+    <g transform="translate(584 747) rotate(109)">
+      <polygon points="-31,19 0,-27 34,20" fill="url(#shellInside)"/>
+      <polygon points="-25,13 0,-21 27,14 2,4" fill="url(#shellTop)"/>
+    </g>
+  </g>
+</svg>
