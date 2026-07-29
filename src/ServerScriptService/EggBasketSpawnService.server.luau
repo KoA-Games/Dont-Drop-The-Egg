@@ -43,11 +43,16 @@ local SHELL_LOWER_INTERIOR_WIDTH = 1.81
 local SHELL_LOWER_INTERIOR_DEPTH = 1.31
 local SHELL_UPPER_INTERIOR_WIDTH = 2.30
 local SHELL_UPPER_INTERIOR_DEPTH = 1.95
-local SHELL_USABLE_HEIGHT = 0.82
+local SHELL_VISIBLE_HEIGHT = 0.82
+-- The imported woven floor has real relief/openings. Keep the egg-only floor
+-- slightly above that visible surface so the larger egg visual cannot poke
+-- through the weave while its spherical collider is resting normally.
+local SHELL_FLOOR_VISUAL_GUARD = 0.12
+local SHELL_USABLE_HEIGHT = SHELL_VISIBLE_HEIGHT - SHELL_FLOOR_VISUAL_GUARD
 local SHELL_WALL_THICKNESS = 0.36
--- Keep the top surface exactly aligned with the visible basket floor, but make
--- the invisible egg-only floor deep enough that a newly network-owned 0.5-stud
--- collider cannot tunnel through it during character spawn/settling.
+-- Keep the raised top surface stable above the visible weave, and make the
+-- invisible egg-only floor deep enough that a newly network-owned collider
+-- cannot tunnel through it during character spawn/settling.
 local SHELL_FLOOR_THICKNESS = 2.40
 
 local activeEggs: { [Model]: { Model } } = {}
@@ -202,7 +207,7 @@ local function addBasketCollisionShell(basket: Model, bottom: BasePart): Model
 	local shell = Instance.new("Model")
 	shell.Name = COLLISION_SHELL_NAME
 	shell.Parent = basket
-	local floorLocalY = bottom.Size.Y * 0.5
+	local floorLocalY = bottom.Size.Y * 0.5 + SHELL_FLOOR_VISUAL_GUARD
 	local rimLocalY = floorLocalY + SHELL_USABLE_HEIGHT
 	shell:SetAttribute("FloorLocalY", floorLocalY)
 	shell:SetAttribute("RimLocalY", rimLocalY)
@@ -211,8 +216,9 @@ local function addBasketCollisionShell(basket: Model, bottom: BasePart): Model
 	shell:SetAttribute("UpperInteriorWidth", SHELL_UPPER_INTERIOR_WIDTH)
 	shell:SetAttribute("UpperInteriorDepth", SHELL_UPPER_INTERIOR_DEPTH)
 
-	-- The thick floor extends downward only; its top stays exactly at the visible
-	-- BottomPanel surface. This retains the existing anti-tunnelling protection.
+	-- The thick floor extends downward only. Its top sits just above the open
+	-- woven surface, preventing the egg visual from showing through while
+	-- retaining the existing anti-tunnelling protection.
 	createShellPart(
 		"BottomCollider",
 		Vector3.new(
@@ -311,10 +317,10 @@ local function generateSpawnLayout(
 	local upperWidth = shell:GetAttribute("UpperInteriorWidth")
 	local upperDepth = shell:GetAttribute("UpperInteriorDepth")
 	if typeof(floorLocalY) ~= "number" then
-		floorLocalY = bottom.Size.Y * 0.5
+		floorLocalY = bottom.Size.Y * 0.5 + SHELL_FLOOR_VISUAL_GUARD
 	end
 	if typeof(rimLocalY) ~= "number" then
-		rimLocalY = floorLocalY + SHELL_USABLE_HEIGHT
+		rimLocalY = bottom.Size.Y * 0.5 + SHELL_VISIBLE_HEIGHT
 	end
 	if typeof(lowerWidth) ~= "number" then
 		lowerWidth = SHELL_LOWER_INTERIOR_WIDTH
@@ -568,7 +574,6 @@ local function spawnEggsInBasket(
 		warn("EggBasketSpawnService: rigid root basket mount was not ready")
 		return
 	end
-
 	local shell = addBasketCollisionShell(basket, bottom)
 	local layout = generateSpawnLayout(bottom, shell, requestedCount)
 

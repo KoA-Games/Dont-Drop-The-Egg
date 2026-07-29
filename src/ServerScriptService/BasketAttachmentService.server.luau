@@ -3,15 +3,48 @@
 local Players = game:GetService("Players")
 local ContentProvider = game:GetService("ContentProvider")
 local RunService = game:GetService("RunService")
+local ServerStorage = game:GetService("ServerStorage")
+local Workspace = game:GetService("Workspace")
+
+local IMPORTED_VISUAL_TEMPLATE_NAME = "DefaultBasketVisualTemplate"
+local IMPORTED_VISUAL_SOURCE_NAMES = {
+	"LowWideWovenBasket_RobloxTextured",
+	"LowWideWovenBasket_RobloxOptimized",
+	"BasketVisualTemplate",
+}
+
+-- Remove the full-size FBX import from the spawn area before any yielding
+-- operation (including animation preloading) can allow a character to spawn on
+-- it. Preserve one private copy for the carried basket visual.
+do
+	local template = ServerStorage:FindFirstChild(IMPORTED_VISUAL_TEMPLATE_NAME)
+	for _, descendant in Workspace:GetDescendants() do
+		local isNamedImport = table.find(IMPORTED_VISUAL_SOURCE_NAMES, descendant.Name) ~= nil
+		local containsMesh = descendant:IsA("BasePart")
+			or (descendant:IsA("Model")
+				and descendant:FindFirstChildWhichIsA("BasePart", true) ~= nil)
+		if isNamedImport and containsMesh then
+			if not template then
+				template = descendant:Clone()
+				template.Name = IMPORTED_VISUAL_TEMPLATE_NAME
+				template.Parent = ServerStorage
+			end
+			descendant:Destroy()
+		end
+	end
+end
 
 -- Measured from Workspace.Rig.Head:ToObjectSpace(Workspace.Rig.Basket:GetPivot()).
 -- This moves only the generated gameplay basket; the preview Basket is not copied.
 -- Keep the authored placement neutral before it is captured by the rigid
 -- HumanoidRootPart mount.
 local BASKET_FORWARD_PITCH_DEGREES = 0
+-- Lower the complete basket assembly so the palms support the lower corners
+-- instead of hovering below the imported visual.
+local BASKET_VERTICAL_ADJUSTMENT = -0.18
 local BASKET_OFFSET = CFrame.new(
 	0.0020941495895385742,
-	0.6161737442016602,
+	0.6161737442016602 + BASKET_VERTICAL_ADJUSTMENT,
 	-0.11329696327447891
 ) * CFrame.Angles(math.rad(BASKET_FORWARD_PITCH_DEGREES), 0, 0)
 
@@ -52,6 +85,14 @@ local WEAVE_DETAIL_THICKNESS = 0.035
 local RIM_HEIGHT = 0.18
 local RIM_THICKNESS = 0.12
 local SUPPORT_THICKNESS = 0.11
+-- The gameplay collision shell, hand contacts, and egg layout were authored
+-- for this size. Imported meshes are uniformly fitted to these outer bounds.
+local IMPORTED_VISUAL_TARGET_SIZE = Vector3.new(
+	UPPER_OUTER_WIDTH,
+	VISUAL_WALL_HEIGHT,
+	UPPER_OUTER_DEPTH
+)
+local IMPORTED_WICKER_FALLBACK_COLOR = Color3.fromRGB(190, 123, 58)
 
 local BOTTOM_COLOR = Color3.fromRGB(151, 94, 42)
 local PANEL_LOWER_COLOR = Color3.fromRGB(171, 111, 51)
@@ -172,6 +213,173 @@ local function createVisualPart(
 	part.Parent = parent
 	weldParts(bottom, part, "BottomWeld")
 	return part
+end
+
+local function isImportedVisualRoot(instance: Instance): boolean
+	if instance:IsA("BasePart") then
+		return true
+	end
+	if not instance:IsA("Model") then
+		return false
+	end
+	for _, descendant in instance:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			return true
+		end
+	end
+	return false
+end
+
+local function getWorkspaceImportedDisplaySources(): { Instance }
+	local sources: { Instance } = {}
+	for _, descendant in Workspace:GetDescendants() do
+		if table.find(IMPORTED_VISUAL_SOURCE_NAMES, descendant.Name)
+			and isImportedVisualRoot(descendant)
+		then
+			table.insert(sources, descendant)
+		end
+	end
+	return sources
+end
+
+local function removeWorkspaceImportedDisplaySources()
+	for _, source in getWorkspaceImportedDisplaySources() do
+		if source.Parent then
+			source:Destroy()
+		end
+	end
+end
+
+local function findImportedVisualTemplate(): Instance?
+	local cached = ServerStorage:FindFirstChild(IMPORTED_VISUAL_TEMPLATE_NAME)
+	if cached and isImportedVisualRoot(cached) then
+		removeWorkspaceImportedDisplaySources()
+		return cached
+	end
+
+	for _, sourceName in IMPORTED_VISUAL_SOURCE_NAMES do
+		local storedSource = ServerStorage:FindFirstChild(sourceName, true)
+		if storedSource and isImportedVisualRoot(storedSource) then
+			removeWorkspaceImportedDisplaySources()
+			return storedSource
+		end
+	end
+
+	local workspaceSources = getWorkspaceImportedDisplaySources()
+	local source = workspaceSources[1]
+	if source then
+		-- Preserve one clean template outside Workspace before removing every
+		-- oversized FBX import/display copy from the spawn area.
+		local template = source:Clone()
+		template.Name = IMPORTED_VISUAL_TEMPLATE_NAME
+		template.Parent = ServerStorage
+		for _, displaySource in workspaceSources do
+			if displaySource.Parent then
+				displaySource:Destroy()
+			end
+		end
+		return template
+	end
+
+	return nil
+end
+
+local function importedVisualBounds(visualRoot: Instance): (CFrame, Vector3)
+	if visualRoot:IsA("Model") then
+		return visualRoot:GetBoundingBox()
+	end
+	local part = visualRoot :: BasePart
+	return part.CFrame, part.Size
+end
+
+local function scaleImportedVisualToGameplaySize(visualRoot: Instance): number
+	local _, currentSize = importedVisualBounds(visualRoot)
+	local scaleFactor = math.min(
+		IMPORTED_VISUAL_TARGET_SIZE.X / math.max(currentSize.X, 0.001),
+		IMPORTED_VISUAL_TARGET_SIZE.Y / math.max(currentSize.Y, 0.001),
+		IMPORTED_VISUAL_TARGET_SIZE.Z / math.max(currentSize.Z, 0.001)
+	)
+
+	if visualRoot:IsA("Model") then
+		visualRoot:ScaleTo(visualRoot:GetScale() * scaleFactor)
+	else
+		local part = visualRoot :: BasePart
+		part.Size *= scaleFactor
+	end
+	return scaleFactor
+end
+
+local function configureImportedVisualPart(part: BasePart, bottom: BasePart)
+	local hasImageTexture = part:IsA("MeshPart") and part.TextureID ~= ""
+	local hasSurfaceAppearance = false
+	for _, child in part:GetChildren() do
+		if child:IsA("SurfaceAppearance") then
+			hasSurfaceAppearance = true
+			-- FBX import can preserve Blender's dark material tint on top of the
+			-- already-colored albedo. White removes that double-darkening while
+			-- preserving the woven Base Color texture and UV layout.
+			child.Color = Color3.new(1, 1, 1)
+		end
+	end
+	if hasImageTexture or hasSurfaceAppearance then
+		part.Color = Color3.new(1, 1, 1)
+	else
+		part.Color = IMPORTED_WICKER_FALLBACK_COLOR
+	end
+	part.Anchored = false
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.Massless = true
+	part.CastShadow = true
+	weldParts(bottom, part, "BottomWeld")
+end
+
+local function createImportedVisualBasket(basket: Model, bottom: BasePart): boolean
+	local template = findImportedVisualTemplate()
+	if not template then
+		return false
+	end
+
+	local visualRoot = template:Clone()
+	visualRoot.Name = "VisualBasket"
+	visualRoot.Parent = basket
+	local scaleFactor = scaleImportedVisualToGameplaySize(visualRoot)
+	local boundsCFrame, boundsSize = importedVisualBounds(visualRoot)
+	local targetBoundsCFrame = bottom.CFrame
+		* CFrame.new(0, bottom.Size.Y * 0.5 + boundsSize.Y * 0.5, 0)
+
+	if visualRoot:IsA("Model") then
+		local pivotToBounds = visualRoot:GetPivot():ToObjectSpace(boundsCFrame)
+		visualRoot:PivotTo(targetBoundsCFrame * pivotToBounds:Inverse())
+	else
+		local part = visualRoot :: BasePart
+		part.CFrame = targetBoundsCFrame
+	end
+
+	local visualPartCount = 0
+	if visualRoot:IsA("BasePart") then
+		configureImportedVisualPart(visualRoot, bottom)
+		visualPartCount += 1
+	end
+	for _, descendant in visualRoot:GetDescendants() do
+		if descendant:IsA("BasePart") then
+			configureImportedVisualPart(descendant, bottom)
+			visualPartCount += 1
+		end
+	end
+
+	if visualPartCount == 0 then
+		visualRoot:Destroy()
+		return false
+	end
+
+	basket:SetAttribute("BasketVisualSource", "ImportedTexturedBasket")
+	basket:SetAttribute("BasketVisualScaleFactor", scaleFactor)
+	basket:SetAttribute("BasketVisualWidth", boundsSize.X)
+	basket:SetAttribute("BasketVisualHeight", boundsSize.Y)
+	basket:SetAttribute("BasketVisualDepth", boundsSize.Z)
+	return true
 end
 
 local function createFolder(name: string, parent: Instance): Folder
@@ -816,7 +1024,13 @@ local function attachBasket(character: Model)
 	basket.PrimaryPart = bottom
 	bottom.Massless = false
 	bottom.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.32, 0, 100, 20)
-	createWovenVisualBasket(basket, bottom)
+	if not createImportedVisualBasket(basket, bottom) then
+		warn(
+			"BasketAttachmentService: imported textured basket was not found; using procedural fallback"
+		)
+		createWovenVisualBasket(basket, bottom)
+		basket:SetAttribute("BasketVisualSource", "ProceduralFallback")
+	end
 	createHandTarget(bottom, "LeftHandContact", CFrame.new(-0.98, -0.10, 0))
 	createHandTarget(bottom, "RightHandContact", CFrame.new(0.98, -0.10, 0))
 
@@ -942,6 +1156,13 @@ local function onPlayerAdded(player: Player)
 	if player.Character then
 		task.spawn(attachBasket, player.Character)
 	end
+end
+
+-- Consume the FBX import as a template before any character can spawn on it.
+-- Only the carried runtime clone is allowed to remain in Workspace.
+local startupTemplate = findImportedVisualTemplate()
+if not startupTemplate then
+	warn("BasketAttachmentService: no imported basket template was found at startup")
 end
 
 Players.PlayerAdded:Connect(onPlayerAdded)
