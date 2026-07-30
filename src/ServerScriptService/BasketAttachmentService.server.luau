@@ -113,6 +113,11 @@ local HORIZONTAL_MAX_FORCE_PER_MASS = 2400
 local VERTICAL_MAX_FORCE_PER_MASS = 1600
 local ORIENTATION_RESPONSIVENESS = 100
 local ORIENTATION_MAX_TORQUE_PER_MASS = 1400
+-- Keep loose eggs out of the basket while the mount changes from its bootstrap
+-- weld to the hand-following constraints. This changes only initialization
+-- timing; it does not alter gravity, constraint forces, or egg physics.
+local INITIAL_MOUNT_SETTLE_TIME = 0.6
+
 
 local RIGHT_IK_NAME = "BasketRightArmIK"
 local LEFT_IK_NAME = "BasketLeftArmIK"
@@ -1126,6 +1131,18 @@ local function attachBasket(character: Model)
 					bottom:SetNetworkOwner(basketOwner)
 				end)
 			end
+		end
+
+		-- AlignPosition and AlignOrientation need a short window to take over
+		-- from BasketBootstrapWeld. Publishing readiness immediately allowed
+		-- loose eggs to spawn during that one-time correction and get launched.
+		task.wait(INITIAL_MOUNT_SETTLE_TIME)
+		if not basket.Parent
+			or not bottom.Parent
+			or not target.Parent
+			or not orientationTarget.Parent
+		then
+			return
 		end
 
 		basket:SetAttribute(MOUNT_READY_ATTRIBUTE, true)
