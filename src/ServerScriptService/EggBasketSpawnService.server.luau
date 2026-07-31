@@ -4,6 +4,7 @@ local Players = game:GetService("Players")
 local PhysicsService = game:GetService("PhysicsService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local ServerScriptService = game:GetService("ServerScriptService")
 local ServerStorage = game:GetService("ServerStorage")
 local StarterPlayer = game:GetService("StarterPlayer")
 local Workspace = game:GetService("Workspace")
@@ -23,13 +24,16 @@ local DEFAULT_EGG_COUNT = 5
 local MAX_EGG_COUNT = 30
 local EGG_SPAWN_DELAY = 0.06
 local EGG_REBUILD_DELAY = 0.08
+local EGG_INITIAL_MOUNT_SETTLE_DELAY = 0.35
+local EGG_POST_SPAWN_SETTLE_DELAY = 0.18
+local EGG_SPAWN_LOCK_ATTRIBUTE = "EggSpawnMovementLocked"
 
 -- Raise/lower the egg here relative to Basket.Bottom.
 local EGG_BOTTOM_CLEARANCE = 0.015
 local EGG_COLLIDER_DIAMETER = 0.43
 local EGG_VISUAL_SCALE_FACTOR = 0.86
 local EGG_SPAWN_HORIZONTAL_GAP = 0.035
-local EGG_SPAWN_WALL_MARGIN = 0.04
+local EGG_SPAWN_WALL_MARGIN = 0.12
 local EGG_LAYER_CLEARANCE = 0.008
 -- Real loose eggs must be able to roll when the hand-driven basket changes
 -- direction. The previous high weighted friction made a settled five-egg layer
@@ -49,7 +53,7 @@ local SHELL_VISIBLE_HEIGHT = 0.82
 -- through the weave while its spherical collider is resting normally.
 local SHELL_FLOOR_VISUAL_GUARD = 0.12
 local SHELL_USABLE_HEIGHT = SHELL_VISIBLE_HEIGHT - SHELL_FLOOR_VISUAL_GUARD
-local SHELL_WALL_THICKNESS = 0.36
+local SHELL_WALL_THICKNESS = 0.46
 -- Keep the raised top surface stable above the visible weave, and make the
 -- invisible egg-only floor deep enough that a newly network-owned collider
 -- cannot tunnel through it during character spawn/settling.
@@ -57,6 +61,13 @@ local SHELL_FLOOR_THICKNESS = 2.40
 
 local activeEggs: { [Model]: { Model } } = {}
 local spawnGeneration: { [Player]: number } = {}
+type MovementLockState = {
+	generation: number,
+	character: Model,
+	humanoid: Humanoid,
+	originalWalkSpeed: number,
+}
+local movementLocks: { [Player]: MovementLockState } = {}
 local LEGACY_VERTICAL_STABILIZER_NAME = "EggVerticalStabilizer"
 
 local FORBIDDEN_PHYSICS_CLASSES: { [string]: boolean } = {
@@ -73,6 +84,52 @@ local FORBIDDEN_PHYSICS_CLASSES: { [string]: boolean } = {
 	VectorForce = true,
 	Torque = true,
 }
+
+local function isBrokenEggPrototype(instance: Instance): boolean
+	local compactName = instance.Name:lower():gsub("[%s_%-]", "")
+	return compactName:sub(1, 9) == "brokenegg"
+		or instance:GetAttribute("IsBrokenEgg") == true
+		or instance:GetAttribute("IsBrokenEggPrototype") == true
+end
+
+local function removeBrokenEggPrototypeRemnants()
+	local removalRoots: { Instance } = {}
+	local marked: { [Instance]: boolean } = {}
+	for _, container in {
+		Workspace,
+		ServerStorage,
+		ReplicatedStorage,
+		ServerScriptService,
+		StarterPlayer,
+	} do
+		for _, descendant in container:GetDescendants() do
+			if isBrokenEggPrototype(descendant) then
+				local ancestorMarked = false
+				local ancestor = descendant.Parent
+				while ancestor and ancestor ~= container do
+					if marked[ancestor] then
+						ancestorMarked = true
+						break
+					end
+					ancestor = ancestor.Parent
+				end
+				if not ancestorMarked then
+					marked[descendant] = true
+					table.insert(removalRoots, descendant)
+				end
+			end
+		end
+	end
+
+	for _, instance in removalRoots do
+		if instance.Parent then
+			instance:Destroy()
+		end
+	end
+	if #removalRoots > 0 then
+		print("[EggCleanup] Removed broken egg prototype remnants", #removalRoots)
+	end
+end
 
 local function removeHybridExperimentRemnants()
 	local staleReplicatedConfig = ReplicatedStorage:FindFirstChild("EggTestConfig")
@@ -448,6 +505,57 @@ local function invalidatePlayerSpawn(player: Player): number
 	return generation
 end
 
+local function releaseSpawnMovementLock(player: Player, generation: number?)
+	local state = movementLocks[player]
+	if not state or (generation ~= nil and state.generation ~= generation) then
+		return
+	end
+	movementLocks[player] = nil
+	if state.character.Parent then
+		state.character:SetAttribute(EGG_SPAWN_LOCK_ATTRIBUTE, false)
+	end
+	if state.humanoid.Parent and state.humanoid.Health > 0 then
+		state.humanoid.WalkSpeed = state.originalWalkSpeed
+	end
+end
+
+local function acquireSpawnMovementLock(
+	player: Player,
+	character: Model,
+	generation: number
+): boolean
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return false
+	end
+
+	local existing = movementLocks[player]
+	local originalWalkSpeed = humanoid.WalkSpeed
+	if existing and existing.character == character and existing.humanoid == humanoid then
+		originalWalkSpeed = existing.originalWalkSpeed
+	elseif existing then
+		releaseSpawnMovementLock(player, nil)
+	end
+
+	movementLocks[player] = {
+		generation = generation,
+		character = character,
+		humanoid = humanoid,
+		originalWalkSpeed = originalWalkSpeed,
+	}
+	character:SetAttribute(EGG_SPAWN_LOCK_ATTRIBUTE, true)
+	humanoid.WalkSpeed = 0
+	humanoid:Move(Vector3.zero, false)
+
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if root and root:IsA("BasePart") then
+		local velocity = root.AssemblyLinearVelocity
+		root.AssemblyLinearVelocity = Vector3.new(0, velocity.Y, 0)
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+	return true
+end
+
 local function removeStaleRuntimeEggs()
 	for _, child in Workspace:GetChildren() do
 		if child:IsA("Model") and (child.Name == EGG_NAME or child.Name:match("^" .. EGG_NAME .. "_%d+$")) then
@@ -574,6 +682,17 @@ local function spawnEggsInBasket(
 		warn("EggBasketSpawnService: rigid root basket mount was not ready")
 		return
 	end
+
+	-- Keep loose eggs out of the assembly during the brief hand-follower startup
+	-- transient. This changes only initial placement timing, not egg physics.
+	task.wait(EGG_INITIAL_MOUNT_SETTLE_DELAY)
+	if spawnGeneration[player] ~= generation
+		or player.Character ~= character
+		or not basket.Parent
+		or not bottom.Parent
+	then
+		return
+	end
 	local shell = addBasketCollisionShell(basket, bottom)
 	local layout = generateSpawnLayout(bottom, shell, requestedCount)
 
@@ -611,6 +730,9 @@ local function spawnEggsInBasket(
 		egg:SetAttribute("OwnerUserId", player.UserId)
 		egg:SetAttribute("IsBasketEgg", true)
 		egg:SetAttribute("EggIndex", index)
+		egg:SetAttribute("InBasket", true)
+		egg:SetAttribute("HasLeftBasket", false)
+		egg:SetAttribute("IsBroken", false)
 
 		local collider, forbiddenMovementRemoved = configureCleanEggAssembly(egg)
 		if not collider then
@@ -713,6 +835,11 @@ local function requestEggRebuild(player: Player)
 	local generation = invalidatePlayerSpawn(player)
 	local character = player.Character
 	if not character then
+		releaseSpawnMovementLock(player, nil)
+		cleanUpOwnedWorkspaceEggs(player)
+		return
+	end
+	if not acquireSpawnMovementLock(player, character, generation) then
 		cleanUpOwnedWorkspaceEggs(player)
 		return
 	end
@@ -723,9 +850,19 @@ local function requestEggRebuild(player: Player)
 	task.spawn(function()
 		task.wait(EGG_REBUILD_DELAY)
 		if spawnGeneration[player] ~= generation or player.Character ~= character then
+			releaseSpawnMovementLock(player, generation)
 			return
 		end
-		spawnEggsInBasket(player, character, requestedCount, generation)
+		local succeeded, failure = xpcall(function()
+			spawnEggsInBasket(player, character, requestedCount, generation)
+		end, debug.traceback)
+		if not succeeded then
+			warn("EggBasketSpawnService: egg rebuild failed", failure)
+		end
+		if spawnGeneration[player] == generation and player.Character == character then
+			task.wait(EGG_POST_SPAWN_SETTLE_DELAY)
+		end
+		releaseSpawnMovementLock(player, generation)
 	end)
 end
 
@@ -737,6 +874,7 @@ local function onCharacterAdded(player: Player, character: Model)
 	if humanoid then
 		humanoid.Died:Once(function()
 			invalidatePlayerSpawn(player)
+			releaseSpawnMovementLock(player, nil)
 			cleanUpEggs(character)
 			cleanUpOwnedWorkspaceEggs(player)
 		end)
@@ -754,6 +892,7 @@ local function onPlayerAdded(player: Player)
 	end)
 	player.CharacterRemoving:Connect(function(character: Model)
 		invalidatePlayerSpawn(player)
+		releaseSpawnMovementLock(player, nil)
 		cleanUpEggs(character)
 		cleanUpOwnedWorkspaceEggs(player)
 	end)
@@ -788,6 +927,7 @@ local function getOrCreateSetEggCountRemote(): RemoteEvent
 	return remote
 end
 
+removeBrokenEggPrototypeRemnants()
 configureCollisionGroups()
 removeHybridExperimentRemnants()
 removeLegacyEggVerticalStabilizer(StarterPlayer.StarterCharacterScripts)
@@ -813,6 +953,7 @@ end)
 
 Players.PlayerRemoving:Connect(function(player: Player)
 	invalidatePlayerSpawn(player)
+	releaseSpawnMovementLock(player, nil)
 	if player.Character then
 		cleanUpEggs(player.Character)
 	end
