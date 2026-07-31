@@ -9,7 +9,8 @@ local player = Players.LocalPlayer
 local SLIP_DURATION = 0.95
 local SLIP_COOLDOWN = 1.00
 local MIN_ENTRY_SPEED = 4
-local MIN_SLIDE_SPEED = 24
+local ENTRY_TO_SLIDE_SPEED_MULTIPLIER = 1.60
+local MIN_SLIDE_SPEED = 12
 local MAX_SLIDE_SPEED = 32
 local STEERING_STRENGTH = 0.10
 local MAX_CHAIN_SLIDE_SPEED = 44
@@ -145,7 +146,7 @@ local function beginSlip(now: number)
 	IsSlipping = true
 	slipStartTime = now
 	initialSlideSpeed = math.clamp(
-		math.max(entrySpeed * 1.20, MIN_SLIDE_SPEED),
+		entrySpeed * ENTRY_TO_SLIDE_SPEED_MULTIPLIER,
 		MIN_SLIDE_SPEED,
 		MAX_SLIDE_SPEED
 	)
