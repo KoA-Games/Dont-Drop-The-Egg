@@ -12,6 +12,9 @@ local MIN_ENTRY_SPEED = 4
 local MIN_SLIDE_SPEED = 24
 local MAX_SLIDE_SPEED = 32
 local STEERING_STRENGTH = 0.10
+local MAX_CHAIN_SLIDE_SPEED = 44
+local CHAIN_SPEED_BOOST = 6
+local CHAIN_DIRECTION_INFLUENCE = 0.20
 local END_SPEED_MULTIPLIER = 0.55
 local DETECTION_INTERVAL = 0.03
 
@@ -27,7 +30,7 @@ local character: Model? = nil
 local humanoid: Humanoid? = nil
 local humanoidRootPart: BasePart? = nil
 local overlapParams: OverlapParams? = nil
-local wasOnSlipZone = false
+local touchingSlipZones: { [BasePart]: boolean } = {}
 local detectionAccumulator = 0
 
 local slipStartTime = 0
@@ -98,7 +101,7 @@ local function clearCharacter()
 	humanoid = nil
 	humanoidRootPart = nil
 	overlapParams = nil
-	wasOnSlipZone = false
+	table.clear(touchingSlipZones)
 	detectionAccumulator = 0
 end
 
@@ -172,6 +175,38 @@ local function beginSlip(now: number)
 	slipLinearVelocity = linearVelocity
 end
 
+local function currentSlideSpeed(now: number): number
+	local alpha = math.clamp((now - slipStartTime) / SLIP_DURATION, 0, 1)
+	local endSpeed = initialSlideSpeed * END_SPEED_MULTIPLIER
+	return initialSlideSpeed + (endSpeed - initialSlideSpeed) * alpha
+end
+
+local function extendSlip(now: number)
+	local activeHumanoid = humanoid
+	local root = humanoidRootPart
+	local linearVelocity = slipLinearVelocity
+	if not IsSlipping or not activeHumanoid or not root or not linearVelocity then
+		return
+	end
+
+	local entryDirection, _ = chooseEntryDirection(activeHumanoid, root)
+	local blendedDirection = slideDirection * (1 - CHAIN_DIRECTION_INFLUENCE)
+		+ entryDirection * CHAIN_DIRECTION_INFLUENCE
+	if blendedDirection.Magnitude >= 0.05 then
+		slideDirection = blendedDirection.Unit
+	end
+
+	initialSlideSpeed = math.clamp(
+		math.max(currentSlideSpeed(now) + CHAIN_SPEED_BOOST, MIN_SLIDE_SPEED),
+		MIN_SLIDE_SPEED,
+		MAX_CHAIN_SLIDE_SPEED
+	)
+	slipStartTime = now
+	linearVelocity.PlaneVelocity = Vector2.new(
+		slideDirection.X * initialSlideSpeed,
+		slideDirection.Z * initialSlideSpeed
+	)
+end
 local function getFeetQuery(
 	activeHumanoid: Humanoid,
 	root: BasePart
@@ -186,32 +221,51 @@ local function getFeetQuery(
 	return CFrame.new(queryCenter), Vector3.new(FEET_QUERY_WIDTH, queryHeight, FEET_QUERY_WIDTH)
 end
 
-local function isStandingOnSlipZone(): boolean
+local function getTouchingSlipZones(): { BasePart }
 	local activeHumanoid = humanoid
 	local root = humanoidRootPart
 	local params = overlapParams
 	if not activeHumanoid or not root or not params then
-		return false
+		return {}
 	end
 
 	local queryCFrame, querySize = getFeetQuery(activeHumanoid, root)
 	local nearbyParts = Workspace:GetPartBoundsInBox(queryCFrame, querySize, params)
+	local zones: { BasePart } = {}
 	for _, part in nearbyParts do
 		if part:GetAttribute("IsEggSlipZone") == true then
-			return true
+			table.insert(zones, part)
 		end
 	end
-	return false
+	return zones
 end
 
 local function updateDetection(now: number)
-	local onSlipZone = isStandingOnSlipZone()
-	if onSlipZone and not wasOnSlipZone then
-		beginSlip(now)
+	local zones = getTouchingSlipZones()
+	local currentZones: { [BasePart]: boolean } = {}
+	local nearestNewZone: BasePart? = nil
+	local nearestDistance = math.huge
+	local root = humanoidRootPart
+
+	for _, zone in zones do
+		currentZones[zone] = true
+		if not touchingSlipZones[zone] and root then
+			local distance = (zone.Position - root.Position).Magnitude
+			if distance < nearestDistance then
+				nearestDistance = distance
+				nearestNewZone = zone
+			end
+		end
 	end
-	-- A zone must be fully exited before it can trigger again. This prevents a
-	-- long overlap from retriggering after the cooldown expires.
-	wasOnSlipZone = onSlipZone
+
+	touchingSlipZones = currentZones
+	if nearestNewZone then
+		if IsSlipping then
+			extendSlip(now)
+		else
+			beginSlip(now)
+		end
+	end
 end
 
 local function updateSlip(now: number, deltaTime: number)
@@ -249,8 +303,7 @@ local function updateSlip(now: number, deltaTime: number)
 		slideDirection = slideDirection:Lerp(steeringTarget, responseAlpha).Unit
 	end
 
-	local endSpeed = initialSlideSpeed * END_SPEED_MULTIPLIER
-	local slideSpeed = initialSlideSpeed + (endSpeed - initialSlideSpeed) * alpha
+	local slideSpeed = currentSlideSpeed(now)
 	linearVelocity.PlaneVelocity = Vector2.new(
 		slideDirection.X * slideSpeed,
 		slideDirection.Z * slideSpeed
@@ -313,17 +366,17 @@ RunService.PreSimulation:Connect(function(deltaTime: number)
 	local now = os.clock()
 	if character and character:GetAttribute(EGG_SPAWN_LOCK_ATTRIBUTE) == true then
 		endSlip(now)
-		wasOnSlipZone = false
+		table.clear(touchingSlipZones)
 		detectionAccumulator = 0
 		return
 	end
-	updateSlip(now, deltaTime)
 
 	detectionAccumulator += deltaTime
 	if detectionAccumulator >= DETECTION_INTERVAL then
 		detectionAccumulator %= DETECTION_INTERVAL
 		updateDetection(now)
 	end
+	updateSlip(now, deltaTime)
 end)
 
 if player.Character then
