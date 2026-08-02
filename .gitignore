@@ -29,6 +29,9 @@ sourcemap.json
 *.rbxlx
 *.rbxl.lock
 
+# Keep the canonical place snapshot so a fresh clone can open the current game.
+!Don't Drop The Egg!.rbxl
+
 # macOS
 .DS_Store
 .tools/
