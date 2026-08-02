@@ -13,11 +13,14 @@ local ORIGINAL_RUN_SPEED = 16
 local WALK_SPEED_MULTIPLIER = 0.60
 local WALK_SPEED = ORIGINAL_RUN_SPEED * WALK_SPEED_MULTIPLIER
 local EGG_SPAWN_LOCK_ATTRIBUTE = "EggSpawnMovementLocked"
+local POST_SLIP_SPEED_MULTIPLIER_ATTRIBUTE = "PostSlipSpeedMultiplier"
+local EGG_SLIP_MOVEMENT_ACTIVE_ATTRIBUTE = "EggSlipMovementActive"
 
 local character: Model? = nil
 local humanoid: Humanoid? = nil
 local isShiftHeld = false
 local applyingSpeed = false
+local lastObservedPostSlipMultiplier = 1
 local characterConnections: { RBXScriptConnection } = {}
 
 local function disconnectCharacterConnections()
@@ -32,34 +35,70 @@ local function isMovementLocked(): boolean
 		and character:GetAttribute(EGG_SPAWN_LOCK_ATTRIBUTE) == true
 end
 
+local function isSlipMovementActive(): boolean
+	return character ~= nil
+		and character:GetAttribute(EGG_SLIP_MOVEMENT_ACTIVE_ATTRIBUTE) == true
+end
+
+local function postSlipSpeedMultiplier(): number
+	local activeCharacter = character
+	if not activeCharacter then
+		return 1
+	end
+
+	local value = activeCharacter:GetAttribute(POST_SLIP_SPEED_MULTIPLIER_ATTRIBUTE)
+	if typeof(value) ~= "number" or value ~= value then
+		return 1
+	end
+	return math.clamp(value, 0, 1)
+end
+
 local function desiredSpeed(): number
 	return if isShiftHeld then ORIGINAL_RUN_SPEED else WALK_SPEED
 end
 
-local function applyMovementSpeed()
+local function movementMode(): string
+	return if isShiftHeld then "sprint" else "normal"
+end
+
+local function applyMovementSpeed(logSnapshot: boolean?)
 	local activeHumanoid = humanoid
 	if not activeHumanoid
 		or not activeHumanoid.Parent
 		or activeHumanoid.Health <= 0
 		or isMovementLocked()
+		or isSlipMovementActive()
 	then
 		return
 	end
 
-	local targetSpeed = desiredSpeed()
-	if math.abs(activeHumanoid.WalkSpeed - targetSpeed) <= 0.001 then
-		return
+	local baseSpeed = desiredSpeed()
+	local multiplier = postSlipSpeedMultiplier()
+	local targetSpeed = baseSpeed * multiplier
+	if math.abs(activeHumanoid.WalkSpeed - targetSpeed) > 0.001 then
+		applyingSpeed = true
+		activeHumanoid.WalkSpeed = targetSpeed
+		applyingSpeed = false
 	end
 
-	applyingSpeed = true
-	activeHumanoid.WalkSpeed = targetSpeed
-	applyingSpeed = false
+	if logSnapshot then
+		print(string.format(
+			"[EggSlipSpeed] mode=%s base=%.2f multiplier=%.2f final=%.2f",
+			movementMode(),
+			baseSpeed,
+			multiplier,
+			targetSpeed
+		))
+	end
 end
 
 local function refreshShiftState()
+	local wasShiftHeld = isShiftHeld
 	isShiftHeld = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
 		or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
-	applyMovementSpeed()
+	local modeChangedDuringPenalty = wasShiftHeld ~= isShiftHeld
+		and postSlipSpeedMultiplier() < 1
+	applyMovementSpeed(modeChangedDuringPenalty)
 end
 
 local function clearCharacter()
@@ -67,6 +106,7 @@ local function clearCharacter()
 	character = nil
 	humanoid = nil
 	applyingSpeed = false
+	lastObservedPostSlipMultiplier = 1
 end
 
 local function setupCharacter(newCharacter: Model)
@@ -82,6 +122,7 @@ local function setupCharacter(newCharacter: Model)
 
 	character = newCharacter
 	humanoid = foundHumanoid
+	lastObservedPostSlipMultiplier = postSlipSpeedMultiplier()
 	refreshShiftState()
 
 	table.insert(characterConnections, newCharacter:GetAttributeChangedSignal(
@@ -91,6 +132,29 @@ local function setupCharacter(newCharacter: Model)
 			-- EggBasketSpawnService restores its saved speed immediately after
 			-- clearing the lock. Apply again on the next task turn so the current
 			-- Shift state wins regardless of replication order.
+			task.defer(applyMovementSpeed)
+		end
+	end))
+
+	table.insert(characterConnections, newCharacter:GetAttributeChangedSignal(
+		POST_SLIP_SPEED_MULTIPLIER_ATTRIBUTE
+	):Connect(function()
+		local previousMultiplier = lastObservedPostSlipMultiplier
+		local currentMultiplier = postSlipSpeedMultiplier()
+		lastObservedPostSlipMultiplier = currentMultiplier
+		local penaltyStarted = previousMultiplier >= 1 and currentMultiplier < 1
+		local penaltyEnded = previousMultiplier < 1 and currentMultiplier >= 1
+		task.defer(function()
+			if character == newCharacter then
+				applyMovementSpeed(penaltyStarted or penaltyEnded)
+			end
+		end)
+	end))
+
+	table.insert(characterConnections, newCharacter:GetAttributeChangedSignal(
+		EGG_SLIP_MOVEMENT_ACTIVE_ATTRIBUTE
+	):Connect(function()
+		if newCharacter:GetAttribute(EGG_SLIP_MOVEMENT_ACTIVE_ATTRIBUTE) ~= true then
 			task.defer(applyMovementSpeed)
 		end
 	end))
@@ -122,7 +186,7 @@ UserInputService.InputBegan:Connect(function(input: InputObject)
 	end
 
 	isShiftHeld = true
-	applyMovementSpeed()
+	applyMovementSpeed(postSlipSpeedMultiplier() < 1)
 end)
 
 UserInputService.InputEnded:Connect(function(input: InputObject)
@@ -136,8 +200,9 @@ UserInputService.InputEnded:Connect(function(input: InputObject)
 end)
 
 UserInputService.WindowFocusReleased:Connect(function()
+	local modeChangedDuringPenalty = isShiftHeld and postSlipSpeedMultiplier() < 1
 	isShiftHeld = false
-	applyMovementSpeed()
+	applyMovementSpeed(modeChangedDuringPenalty)
 end)
 
 player.CharacterAdded:Connect(setupCharacter)

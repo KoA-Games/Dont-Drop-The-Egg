@@ -23,6 +23,22 @@ local FEET_QUERY_WIDTH = 2.0
 local FEET_QUERY_EXTRA_DEPTH = 0.65
 local STEERING_RESPONSE = 4.0
 local EGG_SPAWN_LOCK_ATTRIBUTE = "EggSpawnMovementLocked"
+local POST_SLIP_SPEED_MULTIPLIER_ATTRIBUTE = "PostSlipSpeedMultiplier"
+local EGG_SLIP_MOVEMENT_ACTIVE_ATTRIBUTE = "EggSlipMovementActive"
+
+local SLIP_START_ANIMATION_ID = "rbxassetid://125100082914442"
+local SLIP_STRUGGLE_ANIMATION_ID = "rbxassetid://77524598504382"
+local SLIP_RECOVER_ANIMATION_ID = "rbxassetid://80081691988334"
+local ANIMATION_LENGTH_TIMEOUT = 5
+local SLIP_START_TRANSITION_LEAD = 0.04
+local SLIP_START_CROSSFADE = 0.04
+local SLIP_STRUGGLE_TRANSITION_LEAD = 0.06
+local SLIP_STRUGGLE_CROSSFADE = 0.06
+local SLIP_RECOVER_FADE = 0.20
+local POST_SLIP_SPEED_MULTIPLIER = 0.60
+local POST_SLIP_SPEED_RESTORE_DURATION = 0.80
+
+type VisualState = "Idle" | "SlipStart" | "SlipStruggle" | "SlipRecover" | "PostSlipSlow"
 
 local IsSlipping = false
 local LastSlipTime = -math.huge
@@ -30,6 +46,7 @@ local LastSlipTime = -math.huge
 local character: Model? = nil
 local humanoid: Humanoid? = nil
 local humanoidRootPart: BasePart? = nil
+local characterAnimator: Animator? = nil
 local overlapParams: OverlapParams? = nil
 local touchingSlipZones: { [BasePart]: boolean } = {}
 local detectionAccumulator = 0
@@ -41,12 +58,294 @@ local originalAutoRotate: boolean? = nil
 local slipAttachment: Attachment? = nil
 local slipLinearVelocity: LinearVelocity? = nil
 
+local visualState: VisualState = "Idle"
+local sequenceToken = 0
+local animationTracksReady = false
+local slipStartAnimation: Animation? = nil
+local slipStruggleAnimation: Animation? = nil
+local slipRecoverAnimation: Animation? = nil
+local slipStartTrack: AnimationTrack? = nil
+local slipStruggleTrack: AnimationTrack? = nil
+local slipRecoverTrack: AnimationTrack? = nil
+local slipStartLength: number? = nil
+local slipStruggleLength: number? = nil
+local slipRecoverLength: number? = nil
+
+local endSlip: (number) -> () = function() end
+
 local characterDiedConnection: RBXScriptConnection? = nil
 local characterAncestryConnection: RBXScriptConnection? = nil
 local rootAncestryConnection: RBXScriptConnection? = nil
 
 local function horizontal(vector: Vector3): Vector3
 	return Vector3.new(vector.X, 0, vector.Z)
+end
+
+local function stopTrack(track: AnimationTrack?, fadeTime: number)
+	if track and track.IsPlaying then
+		track:Stop(fadeTime)
+	end
+end
+
+local function destroyTrack(track: AnimationTrack?)
+	if track then
+		track:Destroy()
+	end
+end
+
+local function destroyAnimation(animation: Animation?)
+	if animation then
+		animation:Destroy()
+	end
+end
+
+local function resetSlipMovementAttributes()
+	local activeCharacter = character
+	if activeCharacter and activeCharacter.Parent then
+		activeCharacter:SetAttribute(POST_SLIP_SPEED_MULTIPLIER_ATTRIBUTE, 1)
+		activeCharacter:SetAttribute(EGG_SLIP_MOVEMENT_ACTIVE_ATTRIBUTE, false)
+	end
+end
+
+local function clearSlipAnimations()
+	sequenceToken += 1
+	visualState = "Idle"
+	animationTracksReady = false
+
+	stopTrack(slipStartTrack, 0.03)
+	stopTrack(slipStruggleTrack, 0.03)
+	stopTrack(slipRecoverTrack, 0.03)
+	resetSlipMovementAttributes()
+	destroyTrack(slipStartTrack)
+	destroyTrack(slipStruggleTrack)
+	destroyTrack(slipRecoverTrack)
+	destroyAnimation(slipStartAnimation)
+	destroyAnimation(slipStruggleAnimation)
+	destroyAnimation(slipRecoverAnimation)
+
+	slipStartAnimation = nil
+	slipStruggleAnimation = nil
+	slipRecoverAnimation = nil
+	slipStartTrack = nil
+	slipStruggleTrack = nil
+	slipRecoverTrack = nil
+	slipStartLength = nil
+	slipStruggleLength = nil
+	slipRecoverLength = nil
+end
+
+local function resolveTrackLength(
+	track: AnimationTrack,
+	clipName: string,
+	setupToken: number
+): number?
+	local deadline = os.clock() + ANIMATION_LENGTH_TIMEOUT
+	while track.Length <= 0 and os.clock() < deadline do
+		if sequenceToken ~= setupToken or not script.Enabled then
+			return nil
+		end
+		RunService.Heartbeat:Wait()
+	end
+
+	if sequenceToken ~= setupToken then
+		return nil
+	end
+	if track.Length <= 0 then
+		warn(string.format("[EggSlipAnim] Failed to resolve %s length", clipName))
+		return nil
+	end
+
+	return track.Length
+end
+
+local function visualSequenceIsCurrent(token: number, expectedState: VisualState): boolean
+	local activeHumanoid = humanoid
+	return sequenceToken == token
+		and visualState == expectedState
+		and animationTracksReady
+		and activeHumanoid ~= nil
+		and activeHumanoid.Parent ~= nil
+		and activeHumanoid.Health > 0
+end
+
+local function speedRecoveryIsCurrent(
+	token: number,
+	activeCharacter: Model,
+	activeHumanoid: Humanoid
+): boolean
+	return sequenceToken == token
+		and character == activeCharacter
+		and activeCharacter.Parent ~= nil
+		and humanoid == activeHumanoid
+		and activeHumanoid.Parent ~= nil
+		and activeHumanoid.Health > 0
+		and (visualState == "SlipRecover" or visualState == "PostSlipSlow")
+end
+
+local function beginPostSlipSpeedRecovery(token: number): boolean
+	local activeCharacter = character
+	local activeHumanoid = humanoid
+	if not activeCharacter or not activeHumanoid then
+		return false
+	end
+
+	-- Publish a dimensionless penalty. ShiftSprintController remains the only
+	-- owner of Humanoid.WalkSpeed and applies it to normal or sprint speed.
+	activeCharacter:SetAttribute(
+		POST_SLIP_SPEED_MULTIPLIER_ATTRIBUTE,
+		POST_SLIP_SPEED_MULTIPLIER
+	)
+	print("[EggSlipSpeed] penalty start multiplier=0.60")
+
+	-- Remove the controlled slip velocity before normal locomotion resumes.
+	endSlip(os.clock())
+	activeCharacter:SetAttribute(EGG_SLIP_MOVEMENT_ACTIVE_ATTRIBUTE, false)
+
+	task.spawn(function()
+		local elapsed = 0
+		while elapsed < POST_SLIP_SPEED_RESTORE_DURATION do
+			local deltaTime = RunService.Heartbeat:Wait()
+			if not speedRecoveryIsCurrent(token, activeCharacter, activeHumanoid) then
+				return
+			end
+
+			elapsed = math.min(elapsed + deltaTime, POST_SLIP_SPEED_RESTORE_DURATION)
+			local alpha = elapsed / POST_SLIP_SPEED_RESTORE_DURATION
+			local easedAlpha = alpha * alpha * (3 - 2 * alpha)
+			local multiplier = POST_SLIP_SPEED_MULTIPLIER
+				+ (1 - POST_SLIP_SPEED_MULTIPLIER) * easedAlpha
+			activeCharacter:SetAttribute(
+				POST_SLIP_SPEED_MULTIPLIER_ATTRIBUTE,
+				multiplier
+			)
+		end
+
+		if not speedRecoveryIsCurrent(token, activeCharacter, activeHumanoid) then
+			return
+		end
+		activeCharacter:SetAttribute(POST_SLIP_SPEED_MULTIPLIER_ATTRIBUTE, 1)
+		visualState = "Idle"
+		print("[EggSlipSpeed] penalty restored multiplier=1.00")
+	end)
+	return true
+end
+
+local function beginSlipVisual()
+	if visualState ~= "Idle" then
+		return
+	end
+	if not animationTracksReady then
+		warn("[EggSlipAnim] Cannot start because animation tracks are not ready")
+		return
+	end
+
+	local startTrack = slipStartTrack
+	local struggleTrack = slipStruggleTrack
+	local recoverTrack = slipRecoverTrack
+	local startLength = slipStartLength
+	local struggleLength = slipStruggleLength
+	local recoverLength = slipRecoverLength
+	if not startTrack
+		or not struggleTrack
+		or not recoverTrack
+		or not startLength
+		or not struggleLength
+		or not recoverLength
+	then
+		warn("[EggSlipAnim] Cannot start because an animation track length is unavailable")
+		return
+	end
+
+	sequenceToken += 1
+	local token = sequenceToken
+	stopTrack(startTrack, 0.02)
+	stopTrack(struggleTrack, 0.02)
+	stopTrack(recoverTrack, 0.02)
+
+	visualState = "SlipStart"
+	startTrack:Play(0.03, 1, 1)
+
+	task.delay(math.max(startLength - SLIP_START_TRANSITION_LEAD, 0), function()
+		if not visualSequenceIsCurrent(token, "SlipStart") then
+			return
+		end
+
+		visualState = "SlipStruggle"
+		struggleTrack:Play(SLIP_START_CROSSFADE, 1, 1)
+		startTrack:Stop(SLIP_START_CROSSFADE)
+
+		task.delay(math.max(struggleLength - SLIP_STRUGGLE_TRANSITION_LEAD, 0), function()
+			if not visualSequenceIsCurrent(token, "SlipStruggle") then
+				return
+			end
+
+			visualState = "SlipRecover"
+			recoverTrack:Play(SLIP_STRUGGLE_CROSSFADE, 1, 1)
+			struggleTrack:Stop(SLIP_STRUGGLE_CROSSFADE)
+
+			task.delay(math.max(recoverLength - SLIP_RECOVER_FADE, 0), function()
+				if not visualSequenceIsCurrent(token, "SlipRecover") then
+					return
+				end
+
+				local speedRecoveryStarted = beginPostSlipSpeedRecovery(token)
+				recoverTrack:Stop(SLIP_RECOVER_FADE)
+				task.delay(SLIP_RECOVER_FADE, function()
+					if not visualSequenceIsCurrent(token, "SlipRecover") then
+						return
+					end
+					visualState = if speedRecoveryStarted then "PostSlipSlow" else "Idle"
+				end)
+			end)
+		end)
+	end)
+end
+
+local function loadSlipAnimations(animator: Animator, setupToken: number): boolean
+	local startAnimation = Instance.new("Animation")
+	startAnimation.Name = "SlipStartAnimation"
+	startAnimation.AnimationId = SLIP_START_ANIMATION_ID
+	local struggleAnimation = Instance.new("Animation")
+	struggleAnimation.Name = "SlipStruggleAnimation"
+	struggleAnimation.AnimationId = SLIP_STRUGGLE_ANIMATION_ID
+	local recoverAnimation = Instance.new("Animation")
+	recoverAnimation.Name = "SlipRecoverAnimation"
+	recoverAnimation.AnimationId = SLIP_RECOVER_ANIMATION_ID
+
+	slipStartAnimation = startAnimation
+	slipStruggleAnimation = struggleAnimation
+	slipRecoverAnimation = recoverAnimation
+
+	local startTrack = animator:LoadAnimation(startAnimation)
+	local struggleTrack = animator:LoadAnimation(struggleAnimation)
+	local recoverTrack = animator:LoadAnimation(recoverAnimation)
+	startTrack.Priority = Enum.AnimationPriority.Action
+	struggleTrack.Priority = Enum.AnimationPriority.Action
+	recoverTrack.Priority = Enum.AnimationPriority.Action
+	startTrack.Looped = false
+	struggleTrack.Looped = false
+	recoverTrack.Looped = false
+
+	slipStartTrack = startTrack
+	slipStruggleTrack = struggleTrack
+	slipRecoverTrack = recoverTrack
+
+	local resolvedStartLength = resolveTrackLength(startTrack, "SlipStart", setupToken)
+	local resolvedStruggleLength = resolveTrackLength(struggleTrack, "SlipStruggle", setupToken)
+	local resolvedRecoverLength = resolveTrackLength(recoverTrack, "SlipRecover", setupToken)
+	if sequenceToken ~= setupToken
+		or not resolvedStartLength
+		or not resolvedStruggleLength
+		or not resolvedRecoverLength
+	then
+		return false
+	end
+
+	slipStartLength = resolvedStartLength
+	slipStruggleLength = resolvedStruggleLength
+	slipRecoverLength = resolvedRecoverLength
+	animationTracksReady = true
+	return true
 end
 
 local function restoreHumanoidState()
@@ -68,8 +367,10 @@ local function destroySlipMovement()
 	end
 end
 
-local function endSlip(now: number)
+endSlip = function(now: number)
 	if not IsSlipping then
+		destroySlipMovement()
+		restoreHumanoidState()
 		return
 	end
 	IsSlipping = false
@@ -98,9 +399,11 @@ local function clearCharacter()
 	destroySlipMovement()
 	restoreHumanoidState()
 	disconnectCharacterConnections()
+	clearSlipAnimations()
 	character = nil
 	humanoid = nil
 	humanoidRootPart = nil
+	characterAnimator = nil
 	overlapParams = nil
 	table.clear(touchingSlipZones)
 	detectionAccumulator = 0
@@ -125,25 +428,28 @@ local function chooseEntryDirection(activeHumanoid: Humanoid, root: BasePart): (
 	return Vector3.zAxis, entrySpeed
 end
 
-local function beginSlip(now: number)
+local function beginSlip(now: number): boolean
 	local activeHumanoid = humanoid
 	local root = humanoidRootPart
 	if IsSlipping
+		or visualState ~= "Idle"
 		or not activeHumanoid
 		or not root
 		or activeHumanoid.Health <= 0
 		or (character and character:GetAttribute(EGG_SPAWN_LOCK_ATTRIBUTE) == true)
 		or now - LastSlipTime < SLIP_COOLDOWN
 	then
-		return
+		return false
 	end
 
 	local entryDirection, entrySpeed = chooseEntryDirection(activeHumanoid, root)
 	if entrySpeed < MIN_ENTRY_SPEED then
-		return
+		return false
 	end
-
 	IsSlipping = true
+	if character then
+		character:SetAttribute(EGG_SLIP_MOVEMENT_ACTIVE_ATTRIBUTE, true)
+	end
 	slipStartTime = now
 	initialSlideSpeed = math.clamp(
 		entrySpeed * ENTRY_TO_SLIDE_SPEED_MULTIPLIER,
@@ -174,6 +480,7 @@ local function beginSlip(now: number)
 	linearVelocity.ForceLimitsEnabled = false
 	linearVelocity.Parent = root
 	slipLinearVelocity = linearVelocity
+	return true
 end
 
 local function currentSlideSpeed(now: number): number
@@ -264,7 +571,9 @@ local function updateDetection(now: number)
 		if IsSlipping then
 			extendSlip(now)
 		else
-			beginSlip(now)
+			if beginSlip(now) then
+				beginSlipVisual()
+			end
 		end
 	end
 end
@@ -323,10 +632,33 @@ local function setupCharacter(newCharacter: Model)
 	then
 		return
 	end
+	local foundAnimator = foundHumanoid:WaitForChild("Animator", 10)
+	if not foundAnimator or not foundAnimator:IsA("Animator") or newCharacter ~= player.Character then
+		return
+	end
 
 	character = newCharacter
 	humanoid = foundHumanoid
 	humanoidRootPart = foundRoot
+	characterAnimator = foundAnimator
+	newCharacter:SetAttribute(POST_SLIP_SPEED_MULTIPLIER_ATTRIBUTE, 1)
+	newCharacter:SetAttribute(EGG_SLIP_MOVEMENT_ACTIVE_ATTRIBUTE, false)
+	local setupToken = sequenceToken
+	if not loadSlipAnimations(foundAnimator, setupToken) then
+		if sequenceToken == setupToken and character == newCharacter then
+			clearCharacter()
+		end
+		return
+	end
+	if sequenceToken ~= setupToken
+		or newCharacter ~= player.Character
+		or foundHumanoid.Health <= 0
+	then
+		if sequenceToken == setupToken and character == newCharacter then
+			clearCharacter()
+		end
+		return
+	end
 	local params = OverlapParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.FilterDescendantsInstances = { newCharacter }
