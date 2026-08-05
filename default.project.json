@@ -7,6 +7,32 @@
       "$ignoreUnknownInstances": true,
       "$path": "src/ServerScriptService"
     },
+    "ServerStorage": {
+      "$className": "ServerStorage",
+      "$ignoreUnknownInstances": true,
+      "EggRaceTracksuitSurfaceTemplate": {
+        "$className": "MeshPart",
+        "EggRaceTracksuitSurface": {
+          "$className": "SurfaceAppearance",
+          "$properties": {
+            "AlphaMode": "Overlay",
+            "ColorMap": "rbxassetid://70938184504026",
+            "MetalnessMap": "rbxassetid://6972753459",
+            "NormalMap": "rbxassetid://6972753412",
+            "RoughnessMap": "rbxassetid://7478204165"
+          }
+        }
+      }
+    },
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "$ignoreUnknownInstances": true,
+      "AnimationDrafts": {
+        "$className": "Folder",
+        "$ignoreUnknownInstances": true,
+        "$path": "src/ReplicatedStorage/AnimationDrafts"
+      }
+    },
     "StarterPlayer": {
       "$className": "StarterPlayer",
       "StarterCharacterScripts": {
@@ -23,7 +49,8 @@
         "CameraMaxZoomDistance": 128.0,
         "CharacterBreakJointsOnDeath": false,
         "CharacterJumpPower": 12.0,
-        "CharacterUseJumpPower": true
+        "CharacterUseJumpPower": true,
+        "EnableMouseLockOption": false
       },
       "$ignoreUnknownInstances": true
     }

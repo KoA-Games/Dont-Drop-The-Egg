@@ -1,6 +1,7 @@
 --!strict
 
 local Debris = game:GetService("Debris")
+local ContentProvider = game:GetService("ContentProvider")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
@@ -12,16 +13,57 @@ local breakRemote = ReplicatedStorage:WaitForChild("Remotes")
 
 local BREAK_SPEED_THRESHOLD = 13.0
 local RECENT_VELOCITY_MEMORY = 0.30
-local SPLAT_TEXTURE = "rbxassetid://136220663285126"
-local SPLAT_SIZE = 1.70
+local FLOOR_MIN_NORMAL_Y = 0.60
+local FLOOR_CONTACT_TOLERANCE = 0.16
 local SPLAT_THICKNESS = 0.012
 local SPLAT_SURFACE_OFFSET = 0.003
 local SPLASH_PARTICLE_COUNT = 8
 local SPLASH_PARTICLE_LIFETIME = NumberRange.new(0.18, 0.27)
 
+type SplatVariant = {
+	texture: string,
+	size: number,
+}
+
+-- Keep this distance table identical to EggBreakService so the immediate local
+-- impact does not change shape when the authoritative server splat arrives.
+local SPLAT_VARIANTS_SMALL_TO_LARGE: { SplatVariant } = {
+	{ texture = "rbxassetid://121525285901661", size = 1.45 }, -- egg3
+	{ texture = "rbxassetid://79177056137071", size = 1.60 }, -- egg4
+	{ texture = "rbxassetid://118420947274204", size = 1.75 }, -- egg1
+	{ texture = "rbxassetid://110482754432356", size = 1.95 }, -- egg5
+	{ texture = "rbxassetid://107954623201279", size = 2.15 }, -- egg2
+}
+local SPLAT_DISTANCE_THRESHOLDS = { 1.75, 3.50, 5.50, 8.00 }
+
+local function preloadSplatTextures()
+	local preloadTargets: { Instance } = {}
+	for _, splatVariant in SPLAT_VARIANTS_SMALL_TO_LARGE do
+		local image = Instance.new("ImageLabel")
+		image.Image = splatVariant.texture
+		table.insert(preloadTargets, image)
+	end
+
+	local preloadSucceeded, preloadError = pcall(function()
+		ContentProvider:PreloadAsync(preloadTargets)
+	end)
+	for _, image in preloadTargets do
+		image:Destroy()
+	end
+	if not preloadSucceeded then
+		warn("EggBreakImmediate: splat texture preload failed: " .. tostring(preloadError))
+	end
+end
+
+-- Finish the five small image downloads before listening for the first impact.
+-- Existing eggs are registered immediately afterwards, so this only moves the
+-- network wait to startup instead of letting the first broken egg stay blank.
+preloadSplatTextures()
+
 type ClientEggTrack = {
 	egg: Model,
 	collider: BasePart,
+	lastBasketPosition: Vector3,
 	recentFastVelocity: Vector3,
 	recentFastVelocityUntil: number,
 	touchedConnection: RBXScriptConnection?,
@@ -43,13 +85,37 @@ localEffects.Name = "LocalEggBreakEffects"
 localEffects.Archivable = false
 localEffects.Parent = Workspace
 
-local function isOutsideBasket(track: ClientEggTrack): boolean
+local function getOwnerBasket(): Model?
 	local character = player.Character
-	if not character then
-		return false
+	if character then
+		local carriedBasket = character:FindFirstChild("Basket")
+		if carriedBasket and carriedBasket:IsA("Model") then
+			return carriedBasket
+		end
 	end
-	local basket = character:FindFirstChild("Basket")
-	if not basket or not basket:IsA("Model") then
+	local droppedBasket = Workspace:FindFirstChild("DroppedBasket_" .. tostring(player.UserId))
+	return if droppedBasket and droppedBasket:IsA("Model") then droppedBasket else nil
+end
+
+local function selectSplatVariant(
+	track: ClientEggTrack,
+	impactPosition: Vector3
+): (SplatVariant, number, number)
+	local offset = impactPosition - track.lastBasketPosition
+	local travelDistance = Vector3.new(offset.X, 0, offset.Z).Magnitude
+
+	for index, threshold in SPLAT_DISTANCE_THRESHOLDS do
+		if travelDistance < threshold then
+			return SPLAT_VARIANTS_SMALL_TO_LARGE[index], travelDistance, index
+		end
+	end
+	local largestIndex = #SPLAT_VARIANTS_SMALL_TO_LARGE
+	return SPLAT_VARIANTS_SMALL_TO_LARGE[largestIndex], travelDistance, largestIndex
+end
+
+local function isOutsideBasket(track: ClientEggTrack): boolean
+	local basket = getOwnerBasket()
+	if not basket then
 		return false
 	end
 	local bottom = basket:FindFirstChild("Bottom")
@@ -103,7 +169,7 @@ local function getSurface(
 		Vector3.new(0, -(radius * 2 + 4), 0),
 		params
 	)
-	if result and result.Normal.Y >= 0.45 then
+	if result and result.Normal.Y >= FLOOR_MIN_NORMAL_Y then
 		return result.Position, result.Normal
 	end
 
@@ -120,6 +186,32 @@ local function getSurface(
 		end
 	end
 	return nil, nil
+end
+
+local function isVerifiedFloorContact(
+	track: ClientEggTrack,
+	position: Vector3,
+	normal: Vector3
+): boolean
+	if normal.Magnitude < 0.001 or normal.Unit.Y < FLOOR_MIN_NORMAL_Y then
+		return false
+	end
+	local radius = math.max(
+		track.collider.Size.X,
+		track.collider.Size.Y,
+		track.collider.Size.Z
+	) * 0.5
+	local surfaceDistance = (track.collider.Position - position):Dot(normal.Unit)
+	-- A fast collider may already be slightly through the floor when Touched is
+	-- delivered.  Keep the air-gap limit, but accept a confirmed floor crossing.
+	return surfaceDistance <= radius + FLOOR_CONTACT_TOLERANCE
+end
+
+local function approachingImpactSpeed(relativeVelocity: Vector3, normal: Vector3): number
+	if normal.Magnitude < 0.001 then
+		return 0
+	end
+	return math.max(-relativeVelocity:Dot(normal.Unit), 0)
 end
 
 local function makeSurfaceCFrame(position: Vector3, normal: Vector3): CFrame
@@ -192,11 +284,16 @@ local function emitSplashBurst(splat: BasePart)
 	end)
 end
 
-local function createLocalSplat(position: Vector3, normal: Vector3): BasePart
+local function createLocalSplat(
+	track: ClientEggTrack,
+	position: Vector3,
+	normal: Vector3
+): BasePart
 	local surfaceNormal = normal.Unit
+	local splatVariant, travelDistance, variantIndex = selectSplatVariant(track, position)
 	local splat = Instance.new("Part")
 	splat.Name = "LocalBrokenEggSplat"
-	splat.Size = Vector3.new(SPLAT_SIZE, SPLAT_THICKNESS, SPLAT_SIZE)
+	splat.Size = Vector3.new(splatVariant.size, SPLAT_THICKNESS, splatVariant.size)
 	splat.CFrame = makeSurfaceCFrame(
 		position + surfaceNormal * (SPLAT_THICKNESS * 0.5 + SPLAT_SURFACE_OFFSET),
 		surfaceNormal
@@ -207,6 +304,8 @@ local function createLocalSplat(position: Vector3, normal: Vector3): BasePart
 	splat.CanTouch = false
 	splat.CanQuery = false
 	splat.CastShadow = false
+	splat:SetAttribute("TravelDistance", travelDistance)
+	splat:SetAttribute("SplatVariantIndex", variantIndex)
 	splat.Parent = localEffects
 
 	local surfaceGui = Instance.new("SurfaceGui")
@@ -223,7 +322,7 @@ local function createLocalSplat(position: Vector3, normal: Vector3): BasePart
 	image.BackgroundTransparency = 1
 	image.BorderSizePixel = 0
 	image.Size = UDim2.fromScale(1, 1)
-	image.Image = SPLAT_TEXTURE
+	image.Image = splatVariant.texture
 	image.ImageTransparency = 0
 	image.ResampleMode = Enum.ResamplerMode.Default
 	image.ScaleType = Enum.ScaleType.Fit
@@ -271,19 +370,28 @@ local function tryImmediateBreak(track: ClientEggTrack, otherPart: BasePart)
 	end
 
 	local position, normal = getSurface(track, otherPart)
-	if not position or not normal then
+	if not position or not normal or not isVerifiedFloorContact(track, position, normal) then
 		return
 	end
-	local velocity = track.recentFastVelocity
-	local normalSpeed = math.abs(
-		(velocity - otherPart.AssemblyLinearVelocity):Dot(normal.Unit)
+	local currentVelocity = track.collider.AssemblyLinearVelocity
+	local recentVelocity = track.recentFastVelocity
+	local currentNormalSpeed = approachingImpactSpeed(
+		currentVelocity - otherPart.AssemblyLinearVelocity,
+		normal
 	)
+	local recentNormalSpeed = if os.clock() <= track.recentFastVelocityUntil
+		then approachingImpactSpeed(
+			recentVelocity - otherPart.AssemblyLinearVelocity,
+			normal
+		)
+		else 0
+	local normalSpeed = math.max(currentNormalSpeed, recentNormalSpeed)
 	if normalSpeed < BREAK_SPEED_THRESHOLD then
 		return
 	end
 
 	local originals = hideEggLocally(track.egg)
-	local splat = createLocalSplat(position, normal)
+	local splat = createLocalSplat(track, position, normal)
 	pendingVisuals[track.egg] = {
 		splat = splat,
 		position = position,
@@ -295,7 +403,7 @@ local function tryImmediateBreak(track: ClientEggTrack, otherPart: BasePart)
 		track.egg,
 		otherPart,
 		track.collider.Position,
-		velocity
+		if recentNormalSpeed > currentNormalSpeed then recentVelocity else currentVelocity
 	)
 
 	task.delay(1, function()
@@ -342,6 +450,7 @@ local function registerEgg(instance: Instance)
 	local track: ClientEggTrack = {
 		egg = instance,
 		collider = collider,
+		lastBasketPosition = collider.Position,
 		recentFastVelocity = collider.AssemblyLinearVelocity,
 		recentFastVelocityUntil = os.clock() + RECENT_VELOCITY_MEMORY,
 		touchedConnection = nil,
@@ -392,6 +501,11 @@ RunService.Heartbeat:Connect(function()
 		if not egg.Parent or not track.collider.Parent then
 			unregisterEgg(egg)
 		else
+			if track.egg:GetAttribute("HasLeftBasket") ~= true
+				and not isOutsideBasket(track)
+			then
+				track.lastBasketPosition = track.collider.Position
+			end
 			local velocity = track.collider.AssemblyLinearVelocity
 			if now > track.recentFastVelocityUntil
 				or velocity.Magnitude > track.recentFastVelocity.Magnitude

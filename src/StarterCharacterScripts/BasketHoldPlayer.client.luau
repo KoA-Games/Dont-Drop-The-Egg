@@ -3,6 +3,7 @@ local ContentProvider = game:GetService("ContentProvider")
 local character = script.Parent
 local humanoid = character:WaitForChild("Humanoid")
 local animator = humanoid:WaitForChild("Animator")
+local FALL_BASKET_RELEASED_ATTRIBUTE = "FallBasketReleased"
 
 -- 숫자 부분만 네 애니메이션 ID로 교체
 local ANIMATION_ID = "rbxassetid://78788082464822"
@@ -34,11 +35,33 @@ if not loadSuccess then
 end
 
 local track = trackOrError
+track.Name = "BasketHold"
 track.Looped = true
 track.Priority = Enum.AnimationPriority.Action4
 
-track:Play(0, 1, 1)
-track:AdjustWeight(1, 0)
+local function stopReleasedBasketPose()
+	if track.IsPlaying then
+		track:Stop(0.03)
+	end
+end
+
+local function syncBasketHoldState()
+	-- BasketHold is an arm-only Action4 overlay. Once the basket is released it
+	-- must not remain active underneath a fall/get-up animation, otherwise both
+	-- Action4 tracks blend the shoulder and elbow rotations into a twisted pose.
+	if character:GetAttribute(FALL_BASKET_RELEASED_ATTRIBUTE) == true then
+		stopReleasedBasketPose()
+		return
+	end
+
+	if not track.IsPlaying then
+		track:Play(0.05, 1, 1)
+	end
+	track:AdjustWeight(1, 0.05)
+end
+
+character:GetAttributeChangedSignal(FALL_BASKET_RELEASED_ATTRIBUTE):Connect(syncBasketHoldState)
+syncBasketHoldState()
 
 print("[BasketHold] 재생 요청 완료:", ANIMATION_ID)
 
@@ -48,7 +71,5 @@ task.delay(2, function()
 end)
 
 humanoid.Died:Connect(function()
-	if track.IsPlaying then
-		track:Stop(0)
-	end
+	stopReleasedBasketPose()
 end)

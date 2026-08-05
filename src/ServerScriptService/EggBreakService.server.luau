@@ -13,6 +13,7 @@ local HAS_LEFT_BASKET_ATTRIBUTE = "HasLeftBasket"
 local IS_BROKEN_ATTRIBUTE = "IsBroken"
 
 local BASKET_NAME = "Basket"
+local DROPPED_BASKET_PREFIX = "DroppedBasket_"
 local COLLISION_SHELL_NAME = "EggCollisionShell"
 local EGG_COLLISION_GROUP = "Eggs"
 local BASKET_COLLISION_GROUP = "EggBasket"
@@ -23,10 +24,12 @@ local LEAVE_CONFIRM_TIME = 0.05
 local LEAVE_HORIZONTAL_MARGIN = 0.12
 local BELOW_FLOOR_MARGIN = 0.08
 local RECENT_VELOCITY_MEMORY = 0.30
-local PREDICTIVE_CONTACT_LOOKAHEAD = 0.012
+local PREDICTIVE_CONTACT_LOOKAHEAD = 0.004
+local FLOOR_MIN_NORMAL_Y = 0.60
+local FLOOR_CONTACT_TOLERANCE = 0.16
+local SETTLED_GROUND_TOLERANCE = 0.04
 
-local SPLAT_TEXTURE = "rbxassetid://136220663285126"
-local SPLAT_SIZE = 1.70
+local SPLAT_BASE_SIZE = 1.70
 local SPLAT_THICKNESS = 0.012
 local SPLAT_SURFACE_OFFSET = 0.003
 local SPLAT_LIFETIME = 90
@@ -36,10 +39,27 @@ local SLIP_HITBOX_LOCAL_Y = 0.07
 local REMOTES_FOLDER_NAME = "Remotes"
 local BREAK_CANDIDATE_REMOTE_NAME = "EggBreakCandidate"
 
+type SplatVariant = {
+	texture: string,
+	size: number,
+}
+
+-- Ordered by visible white/yolk coverage, from the smallest spill to the
+-- largest. The uploaded labels map to: egg3, egg4, egg1, egg5, egg2.
+local SPLAT_VARIANTS_SMALL_TO_LARGE: { SplatVariant } = {
+	{ texture = "rbxassetid://121525285901661", size = 1.45 }, -- egg3
+	{ texture = "rbxassetid://79177056137071", size = 1.60 }, -- egg4
+	{ texture = "rbxassetid://118420947274204", size = 1.75 }, -- egg1
+	{ texture = "rbxassetid://110482754432356", size = 1.95 }, -- egg5
+	{ texture = "rbxassetid://107954623201279", size = 2.15 }, -- egg2
+}
+local SPLAT_DISTANCE_THRESHOLDS = { 1.75, 3.50, 5.50, 8.00 }
+
 type EggTrack = {
 	egg: Model,
 	collider: BasePart,
 	lastPosition: Vector3,
+	lastBasketPosition: Vector3,
 	lastVelocity: Vector3,
 	recentFastVelocity: Vector3,
 	recentFastVelocityUntil: number,
@@ -99,13 +119,33 @@ local function getOwnerCharacter(egg: Model): Model?
 	return if player then player.Character else nil
 end
 
-local function getBasketBounds(egg: Model): (BasePart?, Model?)
+local function getOwnerBasket(egg: Model): Model?
 	local character = getOwnerCharacter(egg)
-	if not character then
-		return nil, nil
+	if character then
+		local carriedBasket = character:FindFirstChild(BASKET_NAME)
+		if carriedBasket and carriedBasket:IsA("Model") then
+			return carriedBasket
+		end
 	end
-	local basket = character:FindFirstChild(BASKET_NAME)
-	if not basket or not basket:IsA("Model") then
+
+	-- FallBackLeft reparents the same physical basket into Workspace. Keep using
+	-- its live shell bounds so eggs which spill out after the basket lands can
+	-- transition out of InBasket instead of remaining protected forever.
+	local ownerUserId = egg:GetAttribute(OWNER_USER_ID_ATTRIBUTE)
+	if typeof(ownerUserId) == "number" then
+		local droppedBasket = Workspace:FindFirstChild(
+			DROPPED_BASKET_PREFIX .. tostring(ownerUserId)
+		)
+		if droppedBasket and droppedBasket:IsA("Model") then
+			return droppedBasket
+		end
+	end
+	return nil
+end
+
+local function getBasketBounds(egg: Model): (BasePart?, Model?)
+	local basket = getOwnerBasket(egg)
+	if not basket then
 		return nil, nil
 	end
 	local bottom = basket:FindFirstChild("Bottom")
@@ -114,6 +154,22 @@ local function getBasketBounds(egg: Model): (BasePart?, Model?)
 		return nil, nil
 	end
 	return bottom, shell
+end
+
+local function selectSplatVariant(
+	track: EggTrack,
+	impactPosition: Vector3
+): (SplatVariant, number, number)
+	local offset = impactPosition - track.lastBasketPosition
+	local travelDistance = Vector3.new(offset.X, 0, offset.Z).Magnitude
+
+	for index, threshold in SPLAT_DISTANCE_THRESHOLDS do
+		if travelDistance < threshold then
+			return SPLAT_VARIANTS_SMALL_TO_LARGE[index], travelDistance, index
+		end
+	end
+	local largestIndex = #SPLAT_VARIANTS_SMALL_TO_LARGE
+	return SPLAT_VARIANTS_SMALL_TO_LARGE[largestIndex], travelDistance, largestIndex
 end
 
 local function readNumberAttribute(instance: Instance, name: string): number?
@@ -141,10 +197,21 @@ local function isPositionClearlyOutsideBasket(track: EggTrack, worldPosition: Ve
 	local heightAlpha = math.clamp((localCenter.Y - floorY) / math.max(rimY - floorY, 0.001), 0, 1)
 	local interiorWidth = lowerWidth + (upperWidth - lowerWidth) * heightAlpha
 	local interiorDepth = lowerDepth + (upperDepth - lowerDepth) * heightAlpha
+	local radius = math.max(
+		track.collider.Size.X,
+		track.collider.Size.Y,
+		track.collider.Size.Z
+	) * 0.5
+	-- A basket impact can press an egg's centre slightly past the authored
+	-- interior plane while most of the egg is still visibly contained by the
+	-- wall. Treat it as spilled only after the whole collider has cleared the
+	-- rim/wall. Otherwise that one-frame compression permanently sets
+	-- HasLeftBasket and the following ground impact breaks an egg which never
+	-- actually left the basket.
 	local outsideHorizontally = math.abs(localCenter.X)
-		> interiorWidth * 0.5 + LEAVE_HORIZONTAL_MARGIN
-		or math.abs(localCenter.Z) > interiorDepth * 0.5 + LEAVE_HORIZONTAL_MARGIN
-	local radius = track.collider.Size.Y * 0.5
+		> interiorWidth * 0.5 + radius + LEAVE_HORIZONTAL_MARGIN
+		or math.abs(localCenter.Z)
+			> interiorDepth * 0.5 + radius + LEAVE_HORIZONTAL_MARGIN
 	local belowFloor = localCenter.Y < floorY - radius - BELOW_FLOOR_MARGIN
 	return outsideHorizontally or belowFloor
 end
@@ -166,6 +233,7 @@ local function updateBasketState(track: EggTrack, now: number)
 		end
 	else
 		track.outsideSince = nil
+		track.lastBasketPosition = track.collider.Position
 		track.egg:SetAttribute(IN_BASKET_ATTRIBUTE, true)
 	end
 end
@@ -182,11 +250,13 @@ local function makeSurfaceCFrame(position: Vector3, normal: Vector3): CFrame
 	return CFrame.fromMatrix(position, right, up, back)
 end
 
-local function spawnBrokenEggSplat(position: Vector3, normal: Vector3, sourceEgg: Model)
+local function spawnBrokenEggSplat(position: Vector3, normal: Vector3, track: EggTrack)
 	local surfaceNormal = if normal.Magnitude > 0.001 then normal.Unit else Vector3.yAxis
+	local sourceEgg = track.egg
+	local splatVariant, travelDistance, variantIndex = selectSplatVariant(track, position)
 	local splat = Instance.new("Part")
 	splat.Name = "BrokenEggSplat"
-	splat.Size = Vector3.new(SPLAT_SIZE, SPLAT_THICKNESS, SPLAT_SIZE)
+	splat.Size = Vector3.new(splatVariant.size, SPLAT_THICKNESS, splatVariant.size)
 	splat.CFrame = makeSurfaceCFrame(
 		position + surfaceNormal * (SPLAT_THICKNESS * 0.5 + SPLAT_SURFACE_OFFSET),
 		surfaceNormal
@@ -199,6 +269,8 @@ local function spawnBrokenEggSplat(position: Vector3, normal: Vector3, sourceEgg
 	splat.CastShadow = false
 	splat:SetAttribute("SourceOwnerUserId", sourceEgg:GetAttribute(OWNER_USER_ID_ATTRIBUTE))
 	splat:SetAttribute("SourceEggIndex", sourceEgg:GetAttribute("EggIndex"))
+	splat:SetAttribute("TravelDistance", travelDistance)
+	splat:SetAttribute("SplatVariantIndex", variantIndex)
 	splat.Parent = getSplatFolder()
 
 	-- A pixel-dense SurfaceGui keeps the uploaded image noticeably sharper
@@ -217,14 +289,19 @@ local function spawnBrokenEggSplat(position: Vector3, normal: Vector3, sourceEgg
 	image.BackgroundTransparency = 1
 	image.BorderSizePixel = 0
 	image.Size = UDim2.fromScale(1, 1)
-	image.Image = SPLAT_TEXTURE
+	image.Image = splatVariant.texture
 	image.ResampleMode = Enum.ResamplerMode.Default
 	image.ScaleType = Enum.ScaleType.Fit
 	image.Parent = surfaceGui
 
 	local slipHitbox = Instance.new("Part")
 	slipHitbox.Name = "SlipHitbox"
-	slipHitbox.Size = SLIP_HITBOX_SIZE
+	local hitboxScale = splatVariant.size / SPLAT_BASE_SIZE
+	slipHitbox.Size = Vector3.new(
+		SLIP_HITBOX_SIZE.X * hitboxScale,
+		SLIP_HITBOX_SIZE.Y,
+		SLIP_HITBOX_SIZE.Z * hitboxScale
+	)
 	slipHitbox.CFrame = splat.CFrame * CFrame.new(0, SLIP_HITBOX_LOCAL_Y, 0)
 	slipHitbox.Transparency = 1
 	slipHitbox.Anchored = true
@@ -320,6 +397,42 @@ local function unregisterEgg(egg: Model)
 	end
 end
 
+local function isVerifiedFloorContact(
+	track: EggTrack,
+	impactPosition: Vector3,
+	impactNormal: Vector3,
+	centerOverride: Vector3?
+): boolean
+	if impactNormal.Magnitude < 0.001 then
+		return false
+	end
+	local floorNormal = impactNormal.Unit
+	if floorNormal.Y < FLOOR_MIN_NORMAL_Y then
+		return false
+	end
+	local center = centerOverride or track.collider.Position
+	local radius = math.max(
+		track.collider.Size.X,
+		track.collider.Size.Y,
+		track.collider.Size.Z
+	) * 0.5
+	local surfaceDistance = (center - impactPosition):Dot(floorNormal)
+	-- Touched can be delivered after a fast egg has already crossed slightly into
+	-- the floor during the current physics step.  Rejecting that penetration loses
+	-- a real impact.  The upward normal and maximum gap are the air-break guards;
+	-- a negative distance is still a confirmed crossing of that same floor plane.
+	return surfaceDistance <= radius + FLOOR_CONTACT_TOLERANCE
+end
+
+local function approachingImpactSpeed(relativeVelocity: Vector3, normal: Vector3): number
+	if normal.Magnitude < 0.001 then
+		return 0
+	end
+	-- Only velocity travelling into the supporting surface can break an egg.
+	-- abs(dot) incorrectly treated a post-bounce upward velocity as an impact.
+	return math.max(-relativeVelocity:Dot(normal.Unit), 0)
+end
+
 local function completeBreak(
 	track: EggTrack,
 	impactPosition: Vector3,
@@ -339,10 +452,80 @@ local function completeBreak(
 	track.egg:SetAttribute(IS_BROKEN_ATTRIBUTE, true)
 	track.collider.CanCollide = false
 	track.collider.CanTouch = false
-	spawnBrokenEggSplat(impactPosition, impactNormal, track.egg)
+	spawnBrokenEggSplat(impactPosition, impactNormal, track)
 	local egg = track.egg
 	unregisterEgg(egg)
 	egg:Destroy()
+end
+
+local function tryBreakReleasedEggOnGround(track: EggTrack): boolean
+	if track.breaking
+		or not track.egg.Parent
+		or track.egg:GetAttribute(IS_BROKEN_ATTRIBUTE) == true
+		or track.egg:GetAttribute(HAS_LEFT_BASKET_ATTRIBUTE) ~= true
+	then
+		return false
+	end
+
+	local filter: { Instance } = { track.egg }
+	local character = getOwnerCharacter(track.egg)
+	if character then
+		table.insert(filter, character)
+	end
+	local basket = getOwnerBasket(track.egg)
+	if basket then
+		table.insert(filter, basket)
+	end
+	local splatFolder = Workspace:FindFirstChild(SPLAT_FOLDER_NAME)
+	if splatFolder then
+		table.insert(filter, splatFolder)
+	end
+	for otherEgg in trackedEggs do
+		if otherEgg ~= track.egg then
+			table.insert(filter, otherEgg)
+		end
+	end
+
+	local radius = math.max(
+		track.collider.Size.X,
+		track.collider.Size.Y,
+		track.collider.Size.Z
+	) * 0.5
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = filter
+	params.IgnoreWater = false
+	params.RespectCanCollide = true
+	local originHeight = radius + 0.35
+	local result = Workspace:Raycast(
+		track.collider.Position + Vector3.yAxis * originHeight,
+		-Vector3.yAxis * (originHeight + radius + SETTLED_GROUND_TOLERANCE),
+		params
+	)
+	if not result or not result.Instance:IsA("BasePart") then
+		return false
+	end
+	local hitPart = result.Instance :: BasePart
+	if hitPart.CollisionGroup == BASKET_COLLISION_GROUP
+		or hitPart.CollisionGroup == CHARACTER_COLLISION_GROUP
+		or hitPart.CollisionGroup == EGG_COLLISION_GROUP
+	then
+		return false
+	end
+	if result.Normal.Magnitude < 0.001 or result.Normal.Unit.Y < FLOOR_MIN_NORMAL_Y then
+		return false
+	end
+	local surfaceDistance = (track.collider.Position - result.Position):Dot(result.Normal.Unit)
+	if surfaceDistance > radius + SETTLED_GROUND_TOLERANCE then
+		return false
+	end
+
+	-- A released egg resting or rolling on a confirmed floor has already missed
+	-- the one-shot impact callback. Eggs in a basket and eggs still in the air
+	-- never reach this branch, so completing the break here cannot create an
+	-- airborne splat.
+	completeBreak(track, result.Position, result.Normal, BREAK_NORMAL_SPEED_THRESHOLD)
+	return track.breaking
 end
 
 local function tryPredictiveBreak(track: EggTrack): boolean
@@ -400,9 +583,13 @@ local function tryPredictiveBreak(track: EggTrack): boolean
 	then
 		return false
 	end
+	if not isVerifiedFloorContact(track, result.Position, result.Normal) then
+		return false
+	end
 
-	local normalImpactSpeed = math.abs(
-		(currentVelocity - hitPart.AssemblyLinearVelocity):Dot(result.Normal.Unit)
+	local normalImpactSpeed = approachingImpactSpeed(
+		currentVelocity - hitPart.AssemblyLinearVelocity,
+		result.Normal
 	)
 	if normalImpactSpeed < BREAK_NORMAL_SPEED_THRESHOLD then
 		return false
@@ -443,11 +630,14 @@ local function tryBreakEgg(track: EggTrack, otherPart: BasePart)
 	end
 
 	local impactPosition, impactNormal = getImpactSurface(track, otherPart)
+	if not isVerifiedFloorContact(track, impactPosition, impactNormal) then
+		return
+	end
 	local currentRelativeVelocity = track.lastVelocity - otherPart.AssemblyLinearVelocity
 	local recentRelativeVelocity = track.recentFastVelocity - otherPart.AssemblyLinearVelocity
-	local currentNormalSpeed = math.abs(currentRelativeVelocity:Dot(impactNormal.Unit))
+	local currentNormalSpeed = approachingImpactSpeed(currentRelativeVelocity, impactNormal)
 	local recentNormalSpeed = if os.clock() <= track.recentFastVelocityUntil
-		then math.abs(recentRelativeVelocity:Dot(impactNormal.Unit))
+		then approachingImpactSpeed(recentRelativeVelocity, impactNormal)
 		else 0
 	local normalImpactSpeed = math.max(currentNormalSpeed, recentNormalSpeed)
 	if normalImpactSpeed < BREAK_NORMAL_SPEED_THRESHOLD then
@@ -514,8 +704,12 @@ local function tryBreakFromClient(
 	end
 
 	local impactPosition, impactNormal = getImpactSurface(track, otherPart, clientCenter)
-	local normalImpactSpeed = math.abs(
-		(clientVelocity - otherPart.AssemblyLinearVelocity):Dot(impactNormal.Unit)
+	if not isVerifiedFloorContact(track, impactPosition, impactNormal, clientCenter) then
+		return
+	end
+	local normalImpactSpeed = approachingImpactSpeed(
+		clientVelocity - otherPart.AssemblyLinearVelocity,
+		impactNormal
 	)
 	completeBreak(track, impactPosition, impactNormal, normalImpactSpeed)
 end
@@ -546,6 +740,7 @@ local function registerEgg(instance: Instance)
 		egg = instance,
 		collider = collider,
 		lastPosition = collider.Position,
+		lastBasketPosition = collider.Position,
 		lastVelocity = collider.AssemblyLinearVelocity,
 		recentFastVelocity = collider.AssemblyLinearVelocity,
 		recentFastVelocityUntil = os.clock() + RECENT_VELOCITY_MEMORY,
@@ -582,6 +777,9 @@ RunService.Heartbeat:Connect(function()
 			unregisterEgg(egg)
 		else
 			updateBasketState(track, now)
+			if tryBreakReleasedEggOnGround(track) then
+				continue
+			end
 			if tryPredictiveBreak(track) then
 				continue
 			end
