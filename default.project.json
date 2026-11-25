@@ -2,6 +2,28 @@
   "name": "Don't Drop The Egg!",
   "tree": {
     "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "$ignoreUnknownInstances": true,
+      "EggRaceMatchmaking": {
+        "$className": "Folder",
+        "MatchProtocol": {
+          "$path": "src/ReplicatedStorage/EggRaceMatchmaking/MatchProtocol.luau"
+        },
+        "MatchAdmission": {
+          "$path": "src/ReplicatedStorage/EggRaceMatchmaking/MatchAdmission.luau"
+        },
+        "MatchmakingClient": {
+          "$path": "src/ReplicatedStorage/EggRaceMatchmaking/MatchmakingClient.luau"
+        }
+      },
+      "EggRaceMath": {
+        "$className": "Folder",
+        "CameraFit": {
+          "$path": "src/ReplicatedStorage/EggRaceMath/CameraFit.luau"
+        }
+      }
+    },
     "ServerScriptService": {
       "$className": "ServerScriptService",
       "$ignoreUnknownInstances": true,
